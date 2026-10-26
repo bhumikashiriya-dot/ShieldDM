@@ -5,3 +5,4 @@ numpy
 joblib
 plotly
 fpdf2
+reportlab
