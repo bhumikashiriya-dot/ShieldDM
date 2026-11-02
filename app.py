@@ -1,989 +1,1010 @@
-"""
-ShieldDM - chat harassment analyser
-===================================
+"""ShieldDM - Online Harassment & Threat Classifier for DMs
 Run:  streamlit run app.py
-
-Everything shown is computed from the chat YOU paste / upload.
-Demo data (sample_chat.txt) is only loaded when you press the demo button.
+Needs: model.pkl (+ metrics.json) created by `python train.py`
 """
-import datetime as dt
-import hashlib
+import datetime
 import html
-import io
 import json
 import os
 import re
 
-import numpy as np
+import joblib
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE, "model.joblib")
-METRICS_PATH = os.path.join(BASE, "metrics.json")
-SAMPLE_PATH = os.path.join(BASE, "sample_chat.txt")
 
-SAFE_LABELS = {"safe", "normal", "neutral", "clean", "ok", "none", "non-toxic",
-               "nontoxic", "not harmful", "non harmful", "benign", "0", "no",
-               "false", "harmless"}
+# ----------------------------------------------------------------------------
+# CONSTANTS
+# ----------------------------------------------------------------------------
+CATS = ["Threat", "Blackmail", "Intimidation", "Sexual Harassment", "Stalking", "Abusive"]  # priority order
+SEV = {"Threat": 4, "Blackmail": 4, "Intimidation": 3, "Sexual Harassment": 3, "Stalking": 2, "Abusive": 2, "Safe": 0}
+LEVEL = {0: "Safe", 1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
+ICON = {"Threat": "🔴", "Blackmail": "🟣", "Intimidation": "⚠️", "Sexual Harassment": "💗", "Stalking": "🟠",
+        "Abusive": "🟡", "Safe": "🟢"}
+CAT_COLORS = {"Threat": "#ff5c7a", "Blackmail": "#e58bd0", "Intimidation": "#ffc27a", "Sexual Harassment": "#ffb3d1",
+              "Stalking": "#ff9a8a", "Abusive": "#f4cfe0", "Safe": "#4a3a45"}
+LEVEL_COLORS = {"Critical": "#ff5c7a", "High": "#ff9a8a", "Medium": "#ffc27a", "Low": "#f4cfe0", "Safe": "#4a3a45"}
 
-CATEGORY_COLORS = {
-    "Threat": "#ff2d55",
-    "Abuse": "#ff8a65",
-    "Sexual Harassment": "#ff2ea6",
-    "Blackmail": "#b0003a",
-    "Stalking": "#ffb3d1",
-    "Other Harmful": "#b39ba5",
+LAW = {
+    "Threat": "BNS Sec 351 - Criminal intimidation",
+    "Blackmail": "BNS Sec 308 - Extortion; BNS Sec 351 - Criminal intimidation",
+    "Intimidation": "BNS Sec 351 - Criminal intimidation (veiled threats can qualify depending on context)",
+    "Sexual Harassment": "BNS Sec 75 - Sexual harassment; IT Act Sec 67 - Publishing/transmitting obscene material",
+    "Stalking": "BNS Sec 78 - Stalking (including monitoring online activity)",
+    "Abusive": "BNS Sec 79 - Word/gesture intended to insult the modesty of a woman",
 }
-SEVERITY_ORDER = ["Critical", "High", "Medium", "Low"]
-SEVERITY_COLORS = {"Critical": "#ff1744", "High": "#ff5c8a", "Medium": "#ff9e80", "Low": "#ffc2d6"}
 
-# --------------------------------------------------------------------------
-# 1. Rule engine  (category, weight 0-1, reason, regex)
-# --------------------------------------------------------------------------
-_RULES_RAW = [
-    # ---- Threat
-    ("Threat", 0.92, "Explicit threat of violence",
-     r"\b(i('| a)?m|i will|i'll|gonna|going to|will)\s+(kill|murder|hurt|beat|break|destroy|burn|stab|shoot|finish)\b"),
-    ("Threat", 0.92, "Threatens to kill / physically harm the recipient",
-     r"\b(kill|murder|stab|shoot|beat up|break)\s+(you|u|ur|your|her|him|them)\b"),
-    ("Threat", 0.85, "Intimidating warning of harm",
-     r"\b(watch your back|you'?re dead|you are dead|dead meat|you won'?t live|end you|make you pay|teach you a lesson|ruin your life)\b"),
-    ("Threat", 0.70, "Warns of consequences (intimidation)",
-     r"\byou('ll| will)\s+(regret|pay for|be sorry|suffer)\b"),
-    ("Threat", 0.88, "Threat in Hindi/Hinglish",
-     r"\b(maar dunga|jaan se (maar|khatam)|kaat dunga|nahi (chhodunga|chodunga)|barbaad kar dunga|dekh lunga tujhe)\b"),
-    # ---- Abuse
-    ("Abuse", 0.75, "Strong abusive language / slur",
-     r"\b(bitch|bastard|slut|whore|asshole|motherfucker|scum|retard|fuck (you|off)|chutiya|madarchod|bhenchod|behenchod|harami|randi|gandu|kutti|kamina|haramzada)\b"),
-    ("Abuse", 0.50, "Insulting / demeaning language",
-     r"\b(idiot|stupid|dumb|moron|loser|ugly|worthless|useless|trash|pathetic|disgusting|shut up|bakwas|pagal|gadha)\b"),
-    ("Abuse", 0.55, "Demeaning statement about the person's worth",
-     r"\b(nobody|no one)\s+(likes|loves|wants|cares about)\s+(you|u)\b"),
-    ("Abuse", 0.90, "Encourages self-harm / suicide",
-     r"\b(go (die|to hell)|kill yourself|kys|you should (die|disappear)|hope you die)\b"),
+# ---------------------------------------------------------------------------
+# CUE LEXICON.  Each cue = (category, weight 0-1, regex, human label).
+# A cue is ONE linguistic signal. A single weak cue ("last chance") is not enough to flag a message,
+# but several signals together are: the cue weights of a category are combined with a noisy-OR,
+#     score = 1 - (1 - w1)(1 - w2)...(1 - wn)
+# so "ultimatum + veiled warning + conditional warning + final warning" becomes a confident
+# Intimidation detection even though no single violent word appears. The weights are what the
+# sensitivity slider compares against, so the slider changes detection, counts and risk scores.
+# ---------------------------------------------------------------------------
+CUES = [
+    # ---- Threat: explicit and strongly implied violence / consequences
+    ("Threat", 0.95, r"\b(kill|murder|stab|shoot|burn|slap|beat)\b.{0,12}\b(you|u|ur|tujhe|tumhe|teri|tera)\b", "violent threat"),
+    ("Threat", 0.95, r"\bi('| wi)ll (kill|hurt|destroy|ruin|end) (you|u|ur life|your life)", "threat to harm"),
+    ("Threat", 0.95, r"maar (dunga|dalunga|daalunga)|jaan se|teri jaan|kaat dunga|tod (dunga|dalunga)", "violent threat (Hinglish)"),
+    ("Threat", 0.80, r"dekh lunga|dekh lena|chh?odunga nahi|pachtayega|pachtana padega", "intimidation (Hinglish)"),
+    ("Threat", 0.80, r"you('| wi)ll (regret|pay for|pay dearly|pay the price|be sorry)|tujhe barbaad", "threat of consequences"),
+    ("Threat", 0.95, r"\bacid\b.{0,15}\b(face|you|tujh)", "acid threat"),
+    ("Threat", 0.85, r"(make|let) you pay|make you (regret|suffer)|make your life (hell|miserable)", "threat to make you suffer"),
+    ("Threat", 0.75, r"(something|bad things|things) (bad |terrible )?(will|could|can|might) happen to you|you (might|could|will) get hurt|watch your back|sleep with one eye open", "indirect threat of harm"),
+    # ---- Blackmail: threats to expose / leak / ruin, demands under pressure
+    ("Blackmail", 0.95, r"viral kar|leak kar|leak (your|ur|the)", "threat to leak/viral"),
+    ("Blackmail", 0.90, r"i('| wi)ll (post|share|upload|leak|send|show).{0,25}(photos?|pics?|videos?|nudes?|chat|screenshots?)", "threat to share private content"),
+    ("Blackmail", 0.85, r"(photos?|pics?|videos?|screenshots?|chats?).{0,25}(everyone|sabko|sab ko|your (parents|family|friends))", "threat to expose content"),
+    ("Blackmail", 0.85, r"mere paas .{0,30}(photos?|pics?|videos?|screenshots?)", "claims to hold private content"),
+    ("Blackmail", 0.80, r"tell (your|ur) (parents|family|husband|boyfriend|friends)|ghar wal(on|e) ko (bata|bol)", "threat to tell family"),
+    ("Blackmail", 0.85, r"(badnam|expose) (kar|you|u\b)", "threat to defame/expose"),
+    ("Blackmail", 0.90, r"\b(pay|send) (me )?(money|rs\.?|\d{3,}).{0,30}(or|else|otherwise|warna)", "demand for money with threat"),
+    ("Blackmail", 0.70, r"\bi (have|still have|saved|kept) (all )?(your|ur|the) (photos?|pics?|videos?|screenshots?|chats?|messages?|voice notes?|secrets?)\b", "says it holds your private content"),
+    ("Blackmail", 0.70, r"(everyone|everybody|the whole (college|world|class|office)|your (family|parents|friends|boss|husband|boyfriend)) (will|should|would|is going to) (know|find out|see|hear)", "threat to expose to others"),
+    ("Blackmail", 0.85, r"you (don'?t|do not) want (me|this|people|everyone) to (share|tell|show|post|leak|find out|know)", "implied threat to share"),
+    ("Blackmail", 0.80, r"i can (ruin|destroy|expose|finish|end) you|ruin your (life|career|reputation|image|name)", "threat to ruin you"),
+    ("Blackmail", 0.50, r"don'?t tell (anyone|anybody|your (parents|family|friends))|if you tell (anyone|anybody)|keep (this )?(quiet|secret|silent)", "demand for silence"),
+    ("Blackmail", 0.75, r"(want|like) (everyone|everybody|people|the world|your (family|parents|friends)) to (see|know|find out|hear)", "implied threat to expose"),
+    ("Blackmail", 0.85, r"\b(send|give|show|meet|come|sleep|pay).{0,30}\b(or|otherwise|else|warna)\b.{0,40}\b(share|post|tell|leak|expose|everyone|photos?|pics?|videos?|screenshots?)", "demand under threat of exposure"),
+    # ---- Intimidation: indirect / veiled threats, ultimatums, pressure (no violent words needed)
+    ("Intimidation", 0.50, r"\b(last|final|one last) (chance|warning|opportunity)\b", "ultimatum"),
+    ("Intimidation", 0.55, r"consider (this|it|yourself) (your |a |as )?(final |last )?(warning|warned)|(you have|you are|you've) been warned|consider yourself warned", "formal warning"),
+    ("Intimidation", 0.60, r"\b(last|final) time (i('| a)m|i will|i'?ll|i am) (telling|asking|warning|saying)", "last-time ultimatum"),
+    ("Intimidation", 0.70, r"(don'?t|do not) (mistake|confuse) my (silence|kindness|patience|calm|politeness|restraint|good nature)", "veiled warning"),
+    ("Intimidation", 0.55, r"(don'?t|do not|stop) (push|test|provoke|try) (me|my patience|my limits)|you('| a)re (testing|pushing) my (patience|limits)|my patience (is|has) (running|run|wearing)", "pressure on patience"),
+    ("Intimidation", 0.70, r"(no idea|don'?t know|have no clue|can'?t imagine).{0,30}(how (serious|bad|ugly|far)|what i('| a)m capable|what i can do|what i will do|what (i'?m|i am) going to do)", "hints at consequences"),
+    ("Intimidation", 0.70, r"\b(if|unless) you .{0,70}\b(regret|sorry|suffer|consequences?|pay for|pay the price|trouble|worse|ugly|hell|see what happens|find out|end badly|get (serious|hurt|bad|messy))", "conditional warning"),
+    ("Intimidation", 0.60, r"you('| wi)ll (see|find out|learn) (what|how)|wait and see", "veiled warning"),
+    ("Intimidation", 0.55, r"i know (more|a lot|so much) (than you (think|know|realise|realize)|about you)|i know everything about you", "claims hidden knowledge"),
+    ("Intimidation", 0.70, r"i know (what you did|what you've done|what you have done|your (dirty )?secrets?)", "claims to know your secret"),
+    ("Intimidation", 0.45, r"i('| a)m (done|tired|sick) (of )?(being nice|waiting|letting|playing|with your|pretending)|i('| ha)ve had enough|enough is enough|i('| wi)ll not (tolerate|stay quiet|stay silent|let this)|(done|tired of) letting (things|this|it) slide", "escalating tone"),
+    ("Intimidation", 0.50, r"you('| a)re making a (big |huge |terrible |serious |grave )?mistake", "warning of a 'mistake'"),
+    ("Intimidation", 0.70, r"you (don'?t|do not) know who you('| a)re (dealing|messing) with|do you know who i am", "intimidation by status"),
+    ("Intimidation", 0.70, r"\bmy (men|boys|guys|people|gang|friends|brothers) (will|are going to|can|shall)\b.{0,30}(deal|handle|teach|find|come|visit|sort)", "threat through others"),
+    ("Intimidation", 0.60, r"\bor else\b|otherwise you('| wi)ll|warna (tu|tum|aap)", "'or else' ultimatum"),
+    ("Intimidation", 0.60, r"(do|obey|listen).{0,15}what i (say|want|tell)|you will do (as|what) i|obey me", "coercive control"),
+    ("Intimidation", 0.70, r"mujhe mat (aazma|chhed|cheda)|sabr ka imtehaan", "warning not to provoke (Hinglish)"),
+    ("Intimidation", 0.75, r"(ab bhi|abhi bhi) samajh (ja|jao)|anjaam bura|bura hoga|akhri (baar|warning)|last warning hai", "warning (Hinglish)"),
+    ("Intimidation", 0.65, r"you (really |truly )?(don'?t|do not) want to (find out|see|know|learn|test me|make me|push me)", "warns you not to find out"),
+    ("Intimidation", 0.70, r"what i('| a)m capable of", "hints at what it can do"),
+    ("Intimidation", 0.70, r"i can make (things|life|it|everything) (very |really |so )?(difficult|hard|bad|worse|miserable|painful|ugly)", "threat to make life difficult"),
+    ("Intimidation", 0.65, r"(difficult|hard|bad|worse|trouble|pay|suffer|hurt|regret|unsafe).{0,30}(your (family|parents|mother|father|mom|dad|brother|sister|kids?)|people you love)|your (family|parents|mother|father|mom|dad|brother|sister|kids?).{0,40}(pay|suffer|hurt|regret|trouble|difficult|worse|unsafe)", "threat involving family or loved ones"),
+    ("Intimidation", 0.55, r"(don'?t|do not) (underestimate|force|corner) (me|my hand)|i (won'?t|will not) (warn|ask|tell) you (again|twice|nicely)|i won'?t ask (nicely|again|twice)", "warns it will escalate"),
+    ("Intimidation", 0.45, r"i('| ha)ve been (patient|quiet|silent|nice|waiting) (for )?(long enough|too long|a long time)|(my )?patience (is|has) (almost |about to )?(over|gone|ended|run out)", "patience running out"),
+    ("Intimidation", 0.60, r"(learn|understand|realise|realize) (it )?(soon|the hard way)|some people (only )?learn", "'you will learn the hard way'"),
+    ("Intimidation", 0.60, r"(try|test) me and (see|find out)|(see|find out) why people (fear|avoid) me|people who cross me|wouldn'?t (do|try) that if i were you", "warning not to cross me"),
     # ---- Sexual harassment
-    ("Sexual Harassment", 0.92, "Requests nude / explicit images",
-     r"\b(send|show|share)\s+(me\s+)?(your\s+)?(nudes?|nude (pics?|photos?)|naked|boobs|dick pic|private (pics?|photos?)|body pics?)\b"),
-    ("Sexual Harassment", 0.85, "Unwanted sexual proposition",
-     r"\b(sleep with me|have sex|sex with me|hook ?up with me|bed with me|spend the night with me|sexual favou?rs?)\b"),
-    ("Sexual Harassment", 0.92, "Quid-pro-quo sexual demand",
-     r"\b(you owe me|if you want (the job|marks|promotion|passing)).{0,40}\b(sex|night|favou?r|sleep)\b"),
-    ("Sexual Harassment", 0.55, "Unsolicited sexual / objectifying remark",
-     r"\b(sexy|hot body|boobs|tits|horny|nude|naked|touch you|kiss you|your body|figure)\b"),
-    ("Sexual Harassment", 0.60, "Inappropriate invitation / personal probing",
-     r"\b(what are you wearing|come to my (room|place|hotel|flat)|send (me )?(a )?(hot|sexy) (pic|photo|selfie))\b"),
-    # ---- Blackmail
-    ("Blackmail", 0.92, "Threatens to leak / expose content",
-     r"\b(i('| wi)ll|gonna|going to|will)\s+(leak|post|share|expose|upload|send|tell|publish|viral)\b.{0,60}\b(photos?|pics?|videos?|screenshots?|chats?|nudes?|secret|everyone|family|parents|friends|boss|college|internet|online|social media|instagram|facebook)\b"),
-    ("Blackmail", 0.88, "Conditional threat ('or else')",
-     r"\b(or else|otherwise)\b.{0,50}\b(leak|expose|post|share|tell|viral|send)\b"),
-    ("Blackmail", 0.90, "Claims to possess private material",
-     r"\bi have (your|ur)\s+(private\s+)?(photos?|pics?|videos?|nudes?|screenshots?|chats?|recordings?)\b"),
-    ("Blackmail", 0.88, "Demands money under threat",
-     r"\b(pay|send|transfer)\s+(me\s+)?(₹|rs\.?|inr|\$|money|\d{3,}).{0,40}\b(or|else|otherwise|delete)\b"),
-    ("Blackmail", 0.80, "Coercion ('do what I say or...')",
-     r"\bdo (what|as) i (say|tell).{0,40}\b(or|else|otherwise)\b"),
-    ("Blackmail", 0.90, "Blackmail threat in Hindi/Hinglish",
-     r"\b(viral kar|leak kar|sabko bata dunga|sabko dikha dunga|photo viral)\b"),
-    # ---- Stalking
-    ("Stalking", 0.90, "Claims to know the person's location",
-     r"\bi know where you (live|work|study|stay)\b"),
-    ("Stalking", 0.90, "States they are following / watching the person",
-     r"\bi('| a)?m (following|watching|tracking) you\b"),
-    ("Stalking", 0.80, "States they are physically near the person",
-     r"\bi('| a)?m (outside|waiting outside|standing outside|near)\b.{0,25}\b(house|home|hostel|office|college|school|work|door|flat|room|you)\b"),
-    ("Stalking", 0.85, "Says the person cannot escape",
-     r"\byou can'?t (hide|escape|run)\b|\bwherever you go\b|\bevery(where)? you go\b"),
-    ("Stalking", 0.85, "Intends to track / find the person",
-     r"\b(i('| wi)ll|gonna)\s+(find|follow|track|come for)\s+you\b"),
-    ("Stalking", 0.60, "Reports surveilling the person's movements",
-     r"\bi saw you (at|in|near|today|yesterday|with|going|coming)\b"),
-    ("Stalking", 0.50, "Demands location / whereabouts",
-     r"\b(where are you|where r u|who are you with|who were you with|send (me )?(your )?(live )?location)\b"),
-    ("Stalking", 0.50, "Pressures for reply after being ignored / blocked",
-     r"\b(why (are you|r u|did you|didn'?t you) (ignoring|ignore|block|reply|answer|respond)|unblock me|reply (now|me)|pick up (the )?(phone|call))\b"),
+    ("Sexual Harassment", 0.90, r"\bsend (me )?(your |ur )?(nudes?|nude pics?|sexy|boobs|body)", "demand for nude/sexual content"),
+    ("Sexual Harassment", 0.70, r"\bnudes?\b|\bdick pic\b", "sexual content request"),
+    ("Sexual Harassment", 0.90, r"sleep with me|sex with me|have sex|hook ?up|raat (ko )?(milo|aa)", "sexual proposition"),
+    ("Sexual Harassment", 0.70, r"\bhot (body|figure)\b|sexy figure|figure kaisa", "sexualised remark"),
+    ("Sexual Harassment", 0.80, r"rate kya hai|kitna lega|kitne ka hai", "treats person as a commodity"),
+    ("Sexual Harassment", 0.85, r"\b(show|dikha).{0,12}(body|boobs|figure)", "demand to show body"),
+    # ---- Stalking: tracking, surveillance, pressure to respond
+    ("Stalking", 0.60, r"where (?:are|r) (?:you|u)\b(?! (?:going|coming|headed|from|planning|living|studying|off))|kahan (?:hai|ho|hain)\b|kaha ho\b", "tracking whereabouts"),
+    ("Stalking", 0.85, r"\bi('| a)m (outside|downstairs|near your|at your|watching)", "claims to be physically near"),
+    ("Stalking", 0.90, r"i know where you (live|work|study)|tera ghar|tumhara ghar|ghar ke bahar", "knows home/work location"),
+    ("Stalking", 0.80, r"i('| wi)ll find you|\bi saw you\b|saw you (today|at|near)|dekha tujhe", "surveillance / following"),
+    ("Stalking", 0.85, r"i('| a)m (following|tracking|watching) you|following you", "following / tracking"),
+    ("Stalking", 0.65, r"why (are|r) (you|u) (ignoring|not replying|online)|(seen|online) kyun|reply (kyun|nahi)", "pressure over ignored messages"),
+    ("Stalking", 0.60, r"\breply (now|me|fast)\b|answer (me|the phone|my call)|pick up (the|my) (phone|call)", "demanding immediate response"),
+    ("Stalking", 0.65, r"who (are|r) you (talking|chatting) (to|with)|kis se baat", "monitoring contacts"),
+    ("Stalking", 0.65, r"(share|send) (me )?(your |ur )?location|teri location", "demands location"),
+    ("Stalking", 0.75, r"keeping an eye on you|eyes on you|i can see you|i see everything you|i know (everything|all) you do|i know who you('| a)re (with|talking|meeting|chatting)|i know where you (were|went|are)\b", "claims to watch you"),
+    ("Stalking", 0.75, r"you can'?t (hide|escape|run)|no matter where you (go|hide|run)|wherever you go|i('| wi)ll always find you|i will be (there|waiting)", "'you cannot escape'"),
+    ("Stalking", 0.80, r"i know your (daily |usual )?(routine|schedule|timings?|movements|every move)", "knows your routine"),
+    ("Stalking", 0.85, r"i('| a)ve been (tracking|checking|monitoring) your (location|phone|account|profile|activity)|i (saw|checked|read) your (location|phone|messages|chats)", "monitors your location or accounts"),
+    ("Stalking", 0.70, r"i know (exactly )?where you('| ha)ve been|who you (were|are) (with|meeting)", "knows where you have been"),
+    # ---- Abusive language
+    ("Abusive", 0.65, r"\b(bitch|slut|whore|bastard|asshole|idiot|stupid|ugly|loser|shut up)\b", "abusive language"),
+    ("Abusive", 0.80, r"\b(randi|harami|kamina|kamini|kutti|kutta|madarchod|behenchod|bhosdi\w*|chutiya|gandu|bc|mc)\b", "abusive language (Hinglish)"),
 ]
-RULES = [(c, w, reason, re.compile(rx, re.IGNORECASE)) for c, w, reason, rx in _RULES_RAW]
+CUES_C = [(c, w, re.compile(p, re.I), lbl) for c, w, p, lbl in CUES]
+REFUSAL = re.compile(
+    r"stop (?:messaging|texting|calling|it|this)|leave me alone|don'?t (?:message|text|call|contact) me|"
+    r"please stop|i(?:'| wi)ll block|blocked you|mat karo|pareshan mat|mujhe (?:message|call) mat|not interested", re.I)
 
-# --------------------------------------------------------------------------
-# 2. Chat parsing
-# --------------------------------------------------------------------------
-_LINE_RE = re.compile(
-    r"^\[?(?P<date>\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}),?\s+"
-    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s?(?:[APap]\.?\s?[Mm]\.?)?)\]?\s*[-\u2013\u2014]?\s*(?P<rest>.*)$"
-)
-_SENDER_RE = re.compile(r"^(?P<sender>[^:]{1,60}?):\s(?P<msg>.*)$", re.DOTALL)
-_PLAIN_RE = re.compile(r"^(?P<sender>[^:\n]{1,40}?):\s+(?P<msg>.+)$")
-_SKIP_MESSAGES = {"<media omitted>", "image omitted", "video omitted", "sticker omitted",
-                  "audio omitted", "gif omitted", "document omitted"}
-
-
-def decode_bytes(data: bytes) -> str:
-    for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
-        try:
-            return data.decode(enc)
-        except UnicodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _clean_chars(s: str) -> str:
-    for ch in ("\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\ufeff"):
-        s = s.replace(ch, "")
-    return s.replace("\u202f", " ").replace("\u00a0", " ")
-
-
-def parse_chat(raw: str) -> pd.DataFrame:
-    """Parse a WhatsApp export (or plain 'Name: message' text) into a DataFrame."""
-    rows, cur = [], None
-    for line in _clean_chars(raw).splitlines():
-        m = _LINE_RE.match(line)
-        if m:
-            sm = _SENDER_RE.match(m.group("rest"))
-            if sm:
-                cur = {"date": m.group("date"), "time": re.sub(r"[.\s]", "", m.group("time")).upper(),
-                       "sender": sm.group("sender").strip(), "message": sm.group("msg")}
-                rows.append(cur)
-            else:
-                cur = None  # system line such as "Messages are end-to-end encrypted"
-        elif cur is not None and line.strip():
-            cur["message"] += "\n" + line
-        elif cur is not None and not line.strip():
-            continue
-
-    if not rows:  # fallback: plain pasted text, one message per line
-        for line in raw.splitlines():
-            line = _clean_chars(line).strip()
-            if not line:
-                continue
-            pm = _PLAIN_RE.match(line)
-            rows.append({"date": None, "time": None,
-                         "sender": pm.group("sender").strip() if pm else "Unknown",
-                         "message": pm.group("msg") if pm else line})
-
-    df = pd.DataFrame(rows, columns=["date", "time", "sender", "message"])
-    if df.empty:
-        return pd.DataFrame(columns=["timestamp", "sender", "message"])
-
-    df["message"] = df["message"].astype(str).str.strip()
-    df = df[~df["message"].str.lower().isin(_SKIP_MESSAGES)]
-    df = df[df["message"] != ""].reset_index(drop=True)
-
-    stamp = (df["date"].fillna("") + " " + df["time"].fillna("")).str.strip()
-    try:
-        ts = pd.to_datetime(stamp.replace("", np.nan), dayfirst=True, errors="coerce", format="mixed")
-    except (TypeError, ValueError):
-        ts = pd.to_datetime(stamp.replace("", np.nan), dayfirst=True, errors="coerce")
-    df["timestamp"] = ts
-    return df[["timestamp", "sender", "message"]]
-
-
-# --------------------------------------------------------------------------
-# 3. Analysis
-# --------------------------------------------------------------------------
-def label_to_category(label: str) -> str:
-    l = str(label).lower()
-    if "sex" in l:
-        return "Sexual Harassment"
-    if "black" in l or "extort" in l:
-        return "Blackmail"
-    if "stalk" in l:
-        return "Stalking"
-    if "threat" in l or "violen" in l:
-        return "Threat"
-    if "abus" in l or "insult" in l or "toxic" in l or "hate" in l or "harass" in l or "bully" in l:
-        return "Abuse"
-    return "Other Harmful"
-
-
-def match_rules(text: str):
-    return [(c, w, reason) for c, w, reason, rx in RULES if rx.search(text)]
-
-
-def detect_bursts(df: pd.DataFrame, min_run=6, max_minutes=30) -> dict:
-    """Runs of >= min_run consecutive messages from one sender (stalking pattern)."""
-    out = {}
-    if df["sender"].nunique() < 2:
-        return out
-    senders, ts = df["sender"].tolist(), df["timestamp"].tolist()
-    i, n = 0, len(df)
-    while i < n:
-        j = i
-        while j + 1 < n and senders[j + 1] == senders[i]:
-            j += 1
-        run = j - i + 1
-        if run >= min_run:
-            ok = True
-            if pd.notna(ts[i]) and pd.notna(ts[j]):
-                ok = (ts[j] - ts[i]).total_seconds() / 60 <= max_minutes
-            if ok:
-                for k in range(i, j + 1):
-                    out[k] = run
-        i = j + 1
-    return out
-
-
-def severity_from_score(score: float, flagged: bool) -> str:
-    if not flagged:
-        return "None"
-    if score >= 80:
-        return "Critical"
-    if score >= 60:
-        return "High"
-    if score >= 40:
-        return "Medium"
-    return "Low"
-
-
-def analyze(df: pd.DataFrame, model, threshold: float) -> pd.DataFrame:
-    df = df.copy().reset_index(drop=True)
-    n = len(df)
-    texts = df["message"].tolist()
-
-    # ML probabilities (optional - the rule engine works without a model)
-    ml_prob = np.zeros(n)
-    ml_cat = [""] * n
-    ml_label = [""] * n
-    if model is not None and n:
-        try:
-            proba = model.predict_proba(texts)
-            classes = list(model.classes_)
-            harmful_idx = [i for i, c in enumerate(classes) if str(c).strip().lower() not in SAFE_LABELS]
-            ml_prob = proba[:, harmful_idx].sum(axis=1) if harmful_idx else np.zeros(n)
-            for r in range(n):
-                harm_only = [(proba[r, i], classes[i]) for i in harmful_idx]
-                if harm_only:
-                    best = max(harm_only)[1]
-                    ml_label[r], ml_cat[r] = str(best), label_to_category(best)
-        except Exception:
-            ml_prob = np.zeros(n)
-
-    bursts = detect_bursts(df)
-    out = []
-    for i, text in enumerate(texts):
-        matches = match_rules(text)
-        if i in bursts:
-            matches.append(("Stalking", 0.35, f"Part of {bursts[i]} consecutive messages sent without a reply"))
-
-        keep = 1.0
-        for _, w, _ in matches:
-            keep *= (1 - w)
-        rule_score = 100 * (1 - keep)
-        letters = [c for c in text if c.isalpha()]
-        if matches and len(letters) > 8 and sum(c.isupper() for c in letters) / len(letters) > 0.7:
-            rule_score = min(100, rule_score + 5)
-            matches.append((matches[0][0], 0, "Message written in aggressive ALL CAPS"))
-
-        p = float(ml_prob[i])
-        if matches:
-            score = max(rule_score, 0.75 * rule_score + 25 * p)
-        else:
-            score = p * 70 if p >= 0.5 else p * 20
-        ts = df.at[i, "timestamp"]
-        if pd.notna(ts) and ts.hour < 5 and score >= threshold:
-            score = min(100, score + 5)
-            matches.append((matches[0][0] if matches else "Other Harmful", 0, "Sent late at night (00:00-05:00)"))
-        score = float(min(100, score))
-
-        flagged = score >= threshold
-        best_per_cat = {}
-        for c, w, _ in matches:
-            best_per_cat[c] = max(best_per_cat.get(c, 0), w)
-        reasons = []
-        for _, _, r in matches:
-            if r not in reasons:
-                reasons.append(r)
-
-        if best_per_cat:
-            real = {c: w for c, w in best_per_cat.items() if w > 0}
-            primary = max(real, key=real.get) if real else list(best_per_cat)[0]
-        elif flagged:
-            primary = ml_cat[i] or "Other Harmful"
-        else:
-            primary = "Safe"
-        if flagged and not matches and p >= 0.5:
-            reasons.append(f"ML model classed it as '{ml_label[i]}' ({p*100:.0f}% harmful probability)")
-        elif flagged and p >= 0.5:
-            reasons.append(f"ML model also rates it {p*100:.0f}% harmful")
-
-        out.append({
-            "category": primary if flagged else "Safe",
-            "all_categories": ", ".join(sorted(best_per_cat)) if flagged else "",
-            "rule_score": round(rule_score, 1),
-            "ml_prob": round(p, 3),
-            "score": round(score, 1),
-            "flagged": bool(flagged),
-            "severity": severity_from_score(score, flagged),
-            "reasons": "; ".join(reasons) if flagged else "",
-        })
-    res = pd.concat([df, pd.DataFrame(out)], axis=1)
-    res.insert(0, "id", np.arange(1, n + 1))
-    res["hour"] = res["timestamp"].dt.hour
-    return res
-
-
-def overall_risk(res: pd.DataFrame) -> float:
-    fl = res[res["flagged"]]
-    if fl.empty:
-        return 0.0
-    return float(min(100, 0.6 * fl["score"].max() + 0.25 * fl["score"].mean() + min(15, len(fl) * 1.5)))
-
-
-def risk_label(score: float) -> str:
-    if score >= 80:
-        return "CRITICAL"
-    if score >= 60:
-        return "HIGH"
-    if score >= 40:
-        return "MEDIUM"
-    if score > 0:
-        return "LOW"
-    return "NO RISK FOUND"
-
-
-# --------------------------------------------------------------------------
-# 4. Privacy helpers
-# --------------------------------------------------------------------------
-_PHONE_RE = re.compile(r"(?<!\w)(\+?\d[\d\s\-()]{8,}\d)(?!\w)")
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-
-
-def apply_privacy(df: pd.DataFrame, mask_contacts: bool, pseudonymize: bool) -> pd.DataFrame:
-    out = df.copy()
-    if mask_contacts:
-        out["message"] = out["message"].map(lambda s: _EMAIL_RE.sub("[EMAIL]", _PHONE_RE.sub("[PHONE]", s)))
-        out["sender"] = out["sender"].map(lambda s: _PHONE_RE.sub("[PHONE]", s))
-    if pseudonymize:
-        names = sorted(out["sender"].unique())
-        mapping = {nm: f"Person {chr(65 + i) if i < 26 else i + 1}" for i, nm in enumerate(names)}
-        out["sender"] = out["sender"].map(mapping)
-    return out
-
-
-# --------------------------------------------------------------------------
-# 5. Legal PDF report
-# --------------------------------------------------------------------------
-def pdf_safe(s) -> str:
-    """ReportLab's built-in fonts only support Latin-1, so strip everything else."""
-    s = "" if s is None else str(s)
-    s = s.encode("latin-1", "replace").decode("latin-1")
-    return html.escape(s).replace("\n", "<br/>")
-
-
-LEGAL_HINTS_IN = {
-    "Threat": "BNS s.351 (criminal intimidation)",
-    "Abuse": "BNS s.79 / s.351 (insult / intimidation), depending on content",
-    "Sexual Harassment": "BNS s.75 (sexual harassment); IT Act s.67 / 67A if explicit material was sent",
-    "Blackmail": "BNS s.308 (extortion); IT Act s.66E / 67 if intimate images are involved",
-    "Stalking": "BNS s.78 (stalking, including online monitoring / repeated contact)",
-}
-
-
-def build_pdf(res: pd.DataFrame, flagged: pd.DataFrame, accused: str, complainant: str,
-              case_title: str, contact: str, notes: str, jurisdiction: str,
-              source_label: str, raw_hash: str, overall: float, privacy_note: str) -> bytes:
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.platypus import (KeepTogether, Paragraph, SimpleDocTemplate, Spacer,
-                                    Table, TableStyle)
-
-    PINK, DARK, SOFT = colors.HexColor("#d6006f"), colors.HexColor("#1a0a12"), colors.HexColor("#fde7f0")
-    ss = getSampleStyleSheet()
-    h_title = ParagraphStyle("t", parent=ss["Title"], fontName="Helvetica-Bold", fontSize=20,
-                             textColor=PINK, spaceAfter=4, alignment=0)
-    h2 = ParagraphStyle("h2", parent=ss["Heading2"], fontName="Helvetica-Bold", fontSize=12.5,
-                        textColor=PINK, spaceBefore=12, spaceAfter=5)
-    body = ParagraphStyle("b", parent=ss["BodyText"], fontName="Helvetica", fontSize=9.5, leading=13.5)
-    small = ParagraphStyle("s", parent=body, fontSize=8, leading=10.5, textColor=colors.HexColor("#555555"))
-    cell = ParagraphStyle("c", parent=body, fontSize=7.6, leading=9.6)
-    cellb = ParagraphStyle("cb", parent=cell, fontName="Helvetica-Bold", textColor=colors.white)
-
-    def P(t, st=body):
-        return Paragraph(pdf_safe(t), st)
-
-    def footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont("Helvetica", 7.5)
-        canvas.setFillColor(colors.HexColor("#777777"))
-        canvas.drawString(15 * mm, 9 * mm, "ShieldDM - Confidential - automated analysis, requires human verification")
-        canvas.drawRightString(195 * mm, 9 * mm, f"Page {doc.page}")
-        canvas.setStrokeColor(PINK)
-        canvas.setLineWidth(1.2)
-        canvas.line(15 * mm, 13 * mm, 195 * mm, 13 * mm)
-        canvas.restoreState()
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
-                            topMargin=15 * mm, bottomMargin=20 * mm,
-                            title="Legal Complaint Report - ShieldDM", author="ShieldDM")
-    story = []
-
-    # ---- header
-    story += [P("LEGAL COMPLAINT REPORT", h_title),
-              P(case_title or "Digital harassment complaint", ParagraphStyle("sub", parent=body, fontSize=11, textColor=DARK)),
-              Spacer(1, 4)]
-    stamp = dt.datetime.now().strftime("%d %b %Y, %H:%M")
-
-    # ---- incident details
-    flagged_acc = flagged
-    ts_valid = flagged_acc["timestamp"].dropna()
-    period = (f"{ts_valid.min():%d %b %Y %H:%M} to {ts_valid.max():%d %b %Y %H:%M}"
-              if not ts_valid.empty else "Not available (chat contains no timestamps)")
-    cat_counts = flagged_acc["category"].value_counts()
-    top_sev = next((s for s in SEVERITY_ORDER if (flagged_acc["severity"] == s).any()), "None")
-
-    details = [
-        ["Report generated", stamp],
-        ["Complainant", complainant or "Not provided"],
-        ["Complainant contact", contact or "Not provided"],
-        ["Accused / sender", accused],
-        ["Evidence source", source_label],
-        ["Incident period", period],
-        ["Messages analysed", str(len(res))],
-        ["Flagged messages (accused)", str(len(flagged_acc))],
-        ["Highest severity", top_sev],
-        ["Overall risk score", f"{overall:.0f} / 100 ({risk_label(overall).title()})"],
-        ["Evidence SHA-256", raw_hash],
-        ["Privacy settings", privacy_note],
-    ]
-    t = Table([[P(a, cellb if False else ParagraphStyle('k', parent=cell, fontName='Helvetica-Bold')), P(b, cell)] for a, b in details],
-              colWidths=[45 * mm, 135 * mm])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (0, -1), SOFT),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e5b7cb")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    story += [P("1. Incident Details", h2), t]
-
-    # ---- evidence summary
-    story.append(P("2. Evidence Summary", h2))
-    if flagged_acc.empty:
-        story.append(P(f"No messages from {accused} were flagged at the selected sensitivity."))
-    else:
-        parts = [f"Automated analysis of the supplied chat flagged {len(flagged_acc)} message(s) from {accused}, "
-                 f"out of {len(res)} messages in total."]
-        parts.append("Category breakdown: " + ", ".join(f"{k} ({v})" for k, v in cat_counts.items()) + ".")
-        sev_counts = flagged_acc["severity"].value_counts()
-        parts.append("Severity breakdown: " + ", ".join(f"{s} ({sev_counts[s]})" for s in SEVERITY_ORDER if s in sev_counts) + ".")
-        worst = flagged_acc.sort_values("score", ascending=False).iloc[0]
-        wt = f"{worst['timestamp']:%d %b %Y %H:%M}" if pd.notna(worst["timestamp"]) else "unknown time"
-        parts.append(f"The highest-scoring message (risk {worst['score']:.0f}/100, {worst['category']}) was sent at {wt}.")
-        story.append(P(" ".join(parts)))
-    if notes.strip():
-        story += [Spacer(1, 4), P("Complainant's statement / additional notes:", ParagraphStyle('nb', parent=body, fontName='Helvetica-Bold')), P(notes)]
-
-    # ---- flagged messages
-    story.append(P("3. Flagged Messages", h2))
-    if flagged_acc.empty:
-        story.append(P("None."))
-    else:
-        data = [[Paragraph(h, cellb) for h in ("#", "Date / time", "Sender", "Category / severity", "Message", "Why flagged")]]
-        for k, (_, r) in enumerate(flagged_acc.sort_values(["timestamp", "id"]).iterrows(), 1):
-            when = f"{r['timestamp']:%d-%m-%Y %H:%M}" if pd.notna(r["timestamp"]) else "n/a"
-            msg = r["message"] if len(r["message"]) <= 500 else r["message"][:500] + " [...]"
-            data.append([P(str(k), cell), P(when, cell), P(r["sender"], cell),
-                         P(f"{r['category']} / {r['severity']} ({r['score']:.0f})", cell),
-                         P(msg, cell), P(r["reasons"], cell)])
-        mt = Table(data, colWidths=[8 * mm, 23 * mm, 22 * mm, 27 * mm, 56 * mm, 44 * mm], repeatRows=1)
-        mt.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), PINK),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fff4f8")]),
-            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#e5b7cb")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
-        story.append(mt)
-
-    # ---- legal pointers + next steps
-    story.append(P("4. Suggested Next Steps", h2))
-    steps = [
-        "Preserve the evidence: do not delete the chat. Keep the original exported .txt file (its SHA-256 fingerprint is listed above) and take screenshots showing the sender's number/name and timestamps.",
-        "Back up the chat on a second device or cloud storage. Do not edit the exported file; any change alters its fingerprint.",
-        "Avoid replying, arguing or deleting messages. You may block the sender after the evidence is saved.",
-        "Report the account to the messaging platform (in WhatsApp: open chat > Report).",
-        "File a written complaint with the local police station or cyber-crime cell and ask for an acknowledgement / FIR number. Attach this report and the original chat export.",
-        "Consult a lawyer about a protection / restraining order and the sections that apply to your situation.",
-        "Tell a trusted person and consider counselling or a support organisation. You do not have to handle this alone.",
-    ]
-    if jurisdiction == "India":
-        steps.insert(5, "India: you can also file online at the National Cyber Crime Reporting Portal (cybercrime.gov.in); "
-                        "emergency number 112, Women Helpline 181, Cyber Crime Helpline 1930.")
-    for i, s in enumerate(steps, 1):
-        story.append(P(f"{i}. {s}"))
-
-    if jurisdiction == "India" and not flagged_acc.empty:
-        story.append(P("Provisions that may be relevant (indicative only - confirm with a lawyer)", ParagraphStyle('lb', parent=body, fontName='Helvetica-Bold', spaceBefore=6)))
-        for c in cat_counts.index:
-            if c in LEGAL_HINTS_IN:
-                story.append(P(f"- {c}: {LEGAL_HINTS_IN[c]}"))
-
-    story.append(Spacer(1, 10))
-    story.append(KeepTogether([
-        P("Disclaimer", ParagraphStyle('d', parent=body, fontName='Helvetica-Bold', fontSize=8.5)),
-        P("This report was generated automatically by ShieldDM using keyword rules and a machine-learning model. "
-          "It can contain false positives and false negatives and is not legal advice. The complete original chat must be "
-          "reviewed by the complainant, police or a qualified lawyer before any legal action.", small),
-        Spacer(1, 14),
-        P("Complainant signature: ______________________      Date: ________________", body),
-    ]))
-
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
-    return buf.getvalue()
-
-
-# --------------------------------------------------------------------------
-# 6. Styling
-# --------------------------------------------------------------------------
-CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');
-html, body, [class*="css"], .stApp { font-family: 'Poppins', sans-serif; }
-.stApp { background: radial-gradient(1200px 600px at 10% -10%, #3a0a24 0%, transparent 60%),
-                     radial-gradient(900px 500px at 100% 0%, #3d0a1f 0%, transparent 55%), #0b0508; color:#ffe9f1; }
-#MainMenu, footer { visibility:hidden; }
-header[data-testid="stHeader"] { background: transparent; }
-section[data-testid="stSidebar"] { background: linear-gradient(180deg,#16060d 0%,#220a15 100%); border-right:1px solid #ff2ea633; }
-section[data-testid="stSidebar"] * { color:#ffe9f1; }
-h1,h2,h3,h4 { color:#fff; letter-spacing:.2px; }
-@keyframes fadeUp { from {opacity:0; transform:translateY(18px);} to {opacity:1; transform:translateY(0);} }
-@keyframes pulseGlow { 0%,100% { box-shadow:0 0 0 0 #ff2ea655;} 50% { box-shadow:0 0 22px 4px #ff2ea655;} }
-@keyframes gradientMove { 0%{background-position:0% 50%;} 50%{background-position:100% 50%;} 100%{background-position:0% 50%;} }
-@keyframes floaty { 0%,100%{transform:translateY(0);} 50%{transform:translateY(-6px);} }
-.hero { background: linear-gradient(120deg,#ff2d55,#ff2ea6,#c2185b,#ff8a65); background-size:300% 300%;
-        animation: gradientMove 9s ease infinite, fadeUp .7s ease both; border-radius:22px; padding:28px 34px; margin-bottom:22px;
-        box-shadow:0 14px 40px #ff2ea633; }
-.hero h1 { margin:0; font-size:2.2rem; font-weight:800; color:#fff; }
-.hero p { margin:6px 0 0; color:#fff; opacity:.92; font-size:1.02rem; }
-.hero .shield { display:inline-block; animation: floaty 3s ease-in-out infinite; }
-.sd-card { background: linear-gradient(160deg,#1c0b13,#14070d); border:1px solid #ff2ea633; border-radius:18px;
-           padding:18px 20px; animation: fadeUp .6s ease both; transition: transform .25s, border-color .25s, box-shadow .25s; }
-.sd-card:hover { transform: translateY(-4px); border-color:#ff2ea6; box-shadow:0 10px 30px #ff2ea622; }
-.metric .lbl { font-size:.78rem; text-transform:uppercase; letter-spacing:1.2px; color:#ff9fc2; }
-.metric .val { font-size:2.1rem; font-weight:800; color:#fff; line-height:1.15; }
-.metric .sub { font-size:.8rem; color:#d9a6ba; }
-.metric .ico { float:right; font-size:1.7rem; opacity:.9; }
-.flag-card { background:#170a10; border:1px solid #ff2ea633; border-left:6px solid #ff2ea6; border-radius:14px;
-             padding:14px 16px; margin-bottom:12px; animation: fadeUp .5s ease both; }
-.flag-card.sev-Critical { border-left-color:#ff1744; animation: fadeUp .5s ease both, pulseGlow 2.6s infinite; }
-.flag-card.sev-High { border-left-color:#ff5c8a; }
-.flag-card.sev-Medium { border-left-color:#ff9e80; }
-.flag-card.sev-Low { border-left-color:#ffc2d6; }
-.flag-top { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-.badge { padding:3px 11px; border-radius:999px; font-size:.72rem; font-weight:600; color:#fff; }
-.badge.sev-Critical { background:#ff1744; } .badge.sev-High { background:#ff5c8a; }
-.badge.sev-Medium { background:#e8704f; } .badge.sev-Low { background:#b8567a; }
-.badge.cat { background:#2a0f1c; border:1px solid #ff2ea688; color:#ffb3d1; }
-.flag-score { margin-left:auto; font-weight:700; color:#ff8fb8; }
-.flag-meta { font-size:.78rem; color:#c796aa; margin:6px 0; }
-.flag-msg { font-size:.97rem; color:#fff; background:#0e0509; padding:10px 12px; border-radius:10px; margin:6px 0; }
-.flag-reason { font-size:.82rem; color:#ffc2d6; }
-.riskbar { height:10px; background:#2a0f1c; border-radius:99px; overflow:hidden; }
-.riskbar > div { height:100%; background:linear-gradient(90deg,#ff8a65,#ff2d55,#ff2ea6); border-radius:99px; }
-.stButton > button, .stDownloadButton > button { background:linear-gradient(120deg,#ff2d55,#ff2ea6); color:#fff; border:0;
-        border-radius:12px; font-weight:600; padding:.55rem 1.1rem; transition: transform .2s, box-shadow .2s; }
-.stButton > button:hover, .stDownloadButton > button:hover { transform:translateY(-2px) scale(1.01); box-shadow:0 8px 22px #ff2ea64d; color:#fff; border:0; }
-.stTabs [data-baseweb="tab-list"] { gap:6px; }
-.stTabs [data-baseweb="tab"] { background:#1c0b13; border-radius:12px 12px 0 0; padding:10px 18px; color:#ffb3d1; }
-.stTabs [aria-selected="true"] { background:linear-gradient(120deg,#ff2d5533,#ff2ea633); color:#fff !important; border-bottom:3px solid #ff2ea6; }
-div[data-baseweb="input"] input, textarea, div[data-baseweb="select"] > div { background:#14070d !important; color:#fff !important; }
-.step { display:flex; gap:12px; align-items:flex-start; }
-.step .n { background:linear-gradient(120deg,#ff2d55,#ff2ea6); border-radius:50%; width:34px; height:34px; min-width:34px;
-           display:flex; align-items:center; justify-content:center; font-weight:700; }
-.banner { background:#2a0f1c; border:1px dashed #ff2ea6; border-radius:12px; padding:10px 14px; margin-bottom:12px; color:#ffc2d6; }
-</style>
+DEMO_CHAT = """12/10/26, 9:01 pm - Rohan: hey where are you
+12/10/26, 9:02 pm - Rohan: reply now
+12/10/26, 9:02 pm - Rohan: why are you ignoring me
+12/10/26, 9:05 pm - Rohan: i am outside your building
+12/10/26, 9:06 pm - Riya: please stop messaging me
+12/10/26, 9:10 pm - Rohan: reply or i will kill you
+12/10/26, 11:40 pm - Rohan: send nudes or i will viral kar dunga your photos
+12/10/26, 11:42 pm - Riya: leave me alone
+12/10/26, 11:45 pm - Rohan: mere paas tere screenshots hai, sabko bhej dunga
+12/10/26, 11:50 pm - Rohan: call my number 9876543210 or mail me at rohan@example.com
 """
 
 
-def metric_card(icon, label, value, sub=""):
-    return (f'<div class="sd-card metric"><span class="ico">{icon}</span><div class="lbl">{label}</div>'
-            f'<div class="val">{value}</div><div class="sub">{sub}</div></div>')
+# ----------------------------------------------------------------------------
+# PARSING
+# ----------------------------------------------------------------------------
+HDR = re.compile(
+    r"^\[?(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}),?\s+(\d{1,2}[:.]\d{2}(?:[:.]\d{2})?\s?(?:[AaPp]\.?[Mm]\.?)?)\]?\s*(?:[-–—]\s*)?(.*)$")
+PLAIN = re.compile(r"^([^:\n]{1,30}):\s+(.+)$")
 
 
-def style_fig(fig, height=330):
-    fig.update_layout(height=height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font=dict(color="#ffe9f1", family="Poppins"), margin=dict(l=10, r=10, t=40, b=10),
-                      legend=dict(bgcolor="rgba(0,0,0,0)"))
-    fig.update_xaxes(gridcolor="#3a1626", zerolinecolor="#3a1626")
-    fig.update_yaxes(gridcolor="#3a1626", zerolinecolor="#3a1626")
-    return fig
-
-
-def stretch(fn, *args, **kwargs):
-    """Works on both old and new Streamlit versions (width='stretch' vs use_container_width)."""
+def _to_dt(series):
     try:
-        return fn(*args, width="stretch", **kwargs)
-    except TypeError:
-        return fn(*args, use_container_width=True, **kwargs)
+        return pd.to_datetime(series, dayfirst=True, errors="coerce", format="mixed")
+    except (TypeError, ValueError):
+        return pd.to_datetime(series, dayfirst=True, errors="coerce")
 
 
-def ts_str(ts):
-    return f"{ts:%d %b %Y, %H:%M}" if pd.notna(ts) else "no timestamp"
+def parse_chat(raw: str, default_sender: str = "") -> pd.DataFrame:
+    """Parse a WhatsApp export (Android / iPhone), 'Name: msg' lines or plain lines."""
+    for ch in ("\u202f", "\u00a0"):
+        raw = raw.replace(ch, " ")
+    for ch in ("\u200e", "\u200f", "\ufeff", "\r"):
+        raw = raw.replace(ch, "")
+    raw = raw.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')  # phone keyboards use curly quotes
+    lines = raw.split("\n")
+    rows, has_header = [], any(HDR.match(l.strip()) for l in lines)
+    cur = None
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if has_header:
+            m = HDR.match(s)
+            if m:
+                d, t, rest = m.groups()
+                if ": " in rest and len(rest.split(": ", 1)[0]) <= 40:
+                    sender, msg = rest.split(": ", 1)
+                    cur = [(d + " " + t).strip(), sender.strip(), msg.strip()]
+                    rows.append(cur)
+                else:
+                    cur = None  # system line such as "Messages are end-to-end encrypted"
+            elif cur is not None:
+                cur[2] += " " + s  # multi-line message continues
+        else:
+            m = PLAIN.match(s)
+            rows.append(["-", m.group(1).strip(), m.group(2).strip()] if m else ["-", default_sender or "Unknown", s])
+    df = pd.DataFrame(rows, columns=["time", "sender", "message"])
+    if df.empty:
+        return df
+    df["message"] = df["message"].str.replace(r'^"(.*)"$', r"\1", regex=True).str.strip()  # drop quotes wrapped around a pasted line
+    df["ts"] = _to_dt(df["time"].where(df["time"] != "-"))
+    df.insert(0, "no", range(1, len(df) + 1))
+    return df
 
 
-def render_flag_cards(df, limit=25):
-    parts = []
-    for _, r in df.head(limit).iterrows():
-        parts.append(
-            f'<div class="flag-card sev-{r["severity"]}"><div class="flag-top">'
-            f'<span class="badge cat">{html.escape(r["category"])}</span>'
-            f'<span class="badge sev-{r["severity"]}">{r["severity"]}</span>'
-            f'<span class="flag-score">Risk {r["score"]:.0f}/100</span></div>'
-            f'<div class="flag-meta">#{r["id"]} &bull; {html.escape(str(r["sender"]))} &bull; {ts_str(r["timestamp"])}</div>'
-            f'<div class="flag-msg">{html.escape(r["message"]).replace(chr(10), "<br>")}</div>'
-            f'<div class="flag-reason">&#9888; {html.escape(r["reasons"])}</div></div>')
-    st.markdown("".join(parts), unsafe_allow_html=True)
-
-
-# --------------------------------------------------------------------------
-# 7. Model loading
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# DETECTION ENGINE (rules + machine learning)
+# ----------------------------------------------------------------------------
+@st.cache_resource
 def load_model():
-    if not os.path.exists(MODEL_PATH):
-        return None
     try:
-        import joblib
-        return joblib.load(MODEL_PATH)
+        return joblib.load(os.path.join(BASE, "model.pkl"))
     except Exception:
         return None
 
 
+@st.cache_data
 def load_metrics():
-    if os.path.exists(METRICS_PATH):
-        try:
-            with open(METRICS_PATH, encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception:
-            return None
-    return None
+    try:
+        return json.load(open(os.path.join(BASE, "metrics.json")))
+    except Exception:
+        return None
 
 
-# --------------------------------------------------------------------------
-# 8. App
-# --------------------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="ShieldDM", page_icon="🛡️", layout="wide")
-    st.markdown(CSS, unsafe_allow_html=True)
-    ss = st.session_state
-    for k, v in (("raw", ""), ("source", ""), ("upload_sig", None), ("is_demo", False)):
-        ss.setdefault(k, v)
+def sens_to_thr(flag_pct):
+    """Slider value = confidence (%) a message needs before it is flagged. Lower value = flags more."""
+    return round(flag_pct / 100.0, 4)
 
-    model = st.cache_resource(load_model)()
-    metrics = load_metrics()
 
-    # ------------------------------------------------------------ sidebar
-    with st.sidebar:
-        st.markdown("## 🛡️ ShieldDM")
-        st.caption("Detect harassment. Build evidence. Stay protected.")
-        mode = st.radio("Input method", ["📋 Paste chat text", "📁 Upload WhatsApp .txt"])
-        if mode.startswith("📋"):
-            txt = st.text_area("Paste the chat here", height=230, key="paste_box",
-                               placeholder="12/03/2024, 22:14 - Rahul: where are you?\n12/03/2024, 22:15 - Rahul: reply now")
-            if stretch(st.button, "🔍 Analyze pasted text", type="primary"):
-                if txt.strip():
-                    ss.raw, ss.source, ss.is_demo = txt, "Pasted text", False
-                else:
-                    st.warning("Paste some chat text first.")
-        else:
-            up = st.file_uploader("WhatsApp export (.txt)", type=["txt"])
-            if up is not None:
-                sig = (up.name, up.size)
-                if ss.upload_sig != sig:
-                    ss.raw, ss.source, ss.is_demo = decode_bytes(up.getvalue()), f"Uploaded file: {up.name}", False
-                    ss.upload_sig = sig
+def noisy_or(weights):
+    p = 1.0
+    for w in weights:
+        p *= (1.0 - w)
+    return 1.0 - p
 
-        st.divider()
-        if stretch(st.button, "🎬 Load demo data"):
-            if os.path.exists(SAMPLE_PATH):
-                with open(SAMPLE_PATH, "rb") as fh:
-                    ss.raw, ss.source, ss.is_demo = decode_bytes(fh.read()), "Demo data (sample_chat.txt)", True
-            else:
-                st.error("sample_chat.txt not found next to app.py.")
 
-        st.divider()
-        st.markdown("**⚙️ Detection**")
-        threshold = st.slider("Flag sensitivity (lower = flags more)", 10, 80, 35,
-                              help="Messages scoring at or above this value are flagged.")
-        st.markdown("**🔒 Privacy**")
-        mask_contacts = st.toggle("Mask phone numbers & emails", value=True)
-        pseudonymize = st.toggle("Replace sender names with Person A/B", value=False,
-                                 help="Also applies to exports and the PDF. Turn off to put real names in the legal report.")
-        st.caption("Your chat is processed in memory only. Nothing is written to disk or sent anywhere.")
-        if stretch(st.button, "🗑️ Clear all data"):
-            for k in ("raw", "source", "upload_sig", "pdf", "pdf_sig"):
-                ss.pop(k, None)
-            st.rerun()
+def cue_scan(text):
+    """Every linguistic cue found in the message, grouped by category: {cat: [(weight, label, matched text)]}."""
+    out = {}
+    for cat, w, rx, lbl in CUES_C:
+        m = rx.search(text)
+        if m:
+            out.setdefault(cat, []).append((w, lbl, m.group(0).strip()))
+    return out
 
-    # ------------------------------------------------------------ hero
-    st.markdown('<div class="hero"><h1><span class="shield">🛡️</span> ShieldDM</h1>'
-                '<p>AI-powered detection of threats, abuse, sexual harassment, blackmail and stalking in chats '
-                '&mdash; with court-ready evidence reports.</p></div>', unsafe_allow_html=True)
 
-    if not ss.get("raw", "").strip():
-        c = st.columns(3)
-        info = [("1", "Add your chat", "Paste text or upload a WhatsApp export (.txt) from the sidebar."),
-                ("2", "Instant analysis", "Every message is scored for threats, abuse, harassment, blackmail and stalking."),
-                ("3", "Generate evidence", "Download a legal complaint PDF built from your real chat.")]
-        for col, (n, t, d) in zip(c, info):
-            col.markdown(f'<div class="sd-card step"><div class="n">{n}</div><div><b>{t}</b><br>'
-                         f'<span style="color:#d9a6ba;font-size:.88rem">{d}</span></div></div>', unsafe_allow_html=True)
-        st.info("Nothing is analysed until you add a chat. Use **Load demo data** in the sidebar if you just want to explore.")
-        if model is None:
-            st.warning("No trained model found. Run `python train.py` once to enable ML scoring. "
-                       "The rule-based detector still works without it.")
-        return
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 
-    # ------------------------------------------------------------ analysis
-    raw = ss.raw
-    parsed = parse_chat(raw)
-    if parsed.empty:
-        st.error("I couldn't find any messages in that text. Check the format and try again.")
-        return
-    res_full = analyze(parsed, model, threshold)
-    res = apply_privacy(res_full, mask_contacts, pseudonymize)
-    raw_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    flagged_all = res[res["flagged"]].copy()
-    overall = overall_risk(res)
-    has_time = res["timestamp"].notna().any()
 
-    if ss.is_demo:
-        st.markdown('<div class="banner">🎬 You are viewing <b>demo data</b>. Paste or upload your own chat to analyse real messages.</div>',
-                    unsafe_allow_html=True)
+def ml_scores(texts):
+    """Sentence-level ML. Each message is split into sentences; the model scores every sentence (and the whole
+    message when it has several), and the highest Threat / Abusive probability wins. This stops a menacing
+    sentence from being diluted by harmless ones around it."""
+    res = [dict() for _ in texts]
+    model = load_model()
     if model is None:
-        st.warning("ML model not found - running with the rule-based detector only. Run `python train.py` to enable ML scoring.")
+        return res
+    vec, clf = model
+    classes = list(clf.classes_)
+    units, owner = [], []
+    for i, t in enumerate(texts):
+        if REFUSAL.search(t):  # a refusal ("stop messaging me") is never ML-flagged
+            continue
+        sents = [s.strip() for s in SENT_SPLIT.split(t) if len(s.split()) >= 3]
+        cand = sents + ([t] if len(sents) != 1 and len(t.split()) >= 3 else [])
+        for u in cand:
+            units.append(u)
+            owner.append(i)
+    if not units:
+        return res
+    P = clf.predict_proba(vec.transform(units))
+    for u, i, row in zip(units, owner, P):
+        for c in ("Threat", "Abusive"):
+            if c in classes:
+                p = float(row[classes.index(c)])
+                if p > res[i].get(c, (0.0, ""))[0]:
+                    res[i][c] = (p, u)
+    return res
 
-    tabs = st.tabs(["📊 Dashboard", "🚩 Flagged Messages", "🕒 Timeline", "💬 Full Chat", "🤖 Model Metrics", "⚖️ Legal Report"])
 
-    # ------------------------------------------------------------ dashboard
-    with tabs[0]:
-        top_cat = flagged_all["category"].value_counts().idxmax() if not flagged_all.empty else "None"
-        crit = int(flagged_all["severity"].isin(["Critical", "High"]).sum())
-        cols = st.columns(4)
-        cols[0].markdown(metric_card("💬", "Messages analysed", len(res), f"{res['sender'].nunique()} participant(s)"), unsafe_allow_html=True)
-        cols[1].markdown(metric_card("🚩", "Flagged", len(flagged_all),
-                                     f"{(len(flagged_all) / len(res) * 100):.0f}% of the chat"), unsafe_allow_html=True)
-        cols[2].markdown(metric_card("🔥", "Critical / High", crit, "needs attention"), unsafe_allow_html=True)
-        cols[3].markdown(metric_card("🎯", "Top category", top_cat, f"source: {ss.source}"), unsafe_allow_html=True)
-        st.write("")
+def top_words(vec, clf, text, cls):
+    v = vec.transform([text])
+    i = list(clf.classes_).index(cls)
+    names = vec.get_feature_names_out()
+    c = {names[j]: v[0, j] * clf.coef_[i][j] for j in v.nonzero()[1]}
+    return ", ".join(w for w in sorted(c, key=c.get, reverse=True)[:3] if c[w] > 0)
 
-        g1, g2 = st.columns([1, 1])
-        with g1:
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number", value=overall, number={"suffix": " / 100", "font": {"size": 34}},
-                title={"text": f"Overall risk: {risk_label(overall)}"},
-                gauge={"axis": {"range": [0, 100], "tickcolor": "#ffb3d1"}, "bar": {"color": "#ff2ea6"},
-                       "bgcolor": "#1c0b13", "borderwidth": 0,
-                       "steps": [{"range": [0, 40], "color": "#2a0f1c"}, {"range": [40, 60], "color": "#4a1230"},
-                                 {"range": [60, 80], "color": "#7a1240"}, {"range": [80, 100], "color": "#b0003a"}]}))
-            stretch(st.plotly_chart, style_fig(fig, 320))
-        with g2:
-            if flagged_all.empty:
-                st.success("No harmful messages were flagged at the current sensitivity.")
+
+@st.cache_data(show_spinner=False)
+def analyze(raw: str, sens: int, default_sender: str = ""):
+    """Analyse the REAL text supplied by the user. sens = sensitivity slider (0-100). Returns (dataframe, patterns).
+
+    Three stages: (1) every message is scanned for linguistic cues and scored per category, (2) a sentence-level ML
+    model adds Threat / Abusive, (3) a CONTEXT pass: veiled threats are often sent as several short messages in a row
+    ("Don't test me." / "You really don't want to find out."), so Intimidation cues from consecutive messages by the
+    same sender are combined before deciding."""
+    df = parse_chat(raw, default_sender)
+    if df.empty:
+        return df, []
+    thr = sens_to_thr(sens)          # rule / cue confidence needed to flag
+    ml_thr = min(0.95, thr + 0.15)   # the ML model is noisier, so it needs a little more confidence
+    texts = df["message"].tolist()
+    senders = df["sender"].tolist()
+    ml = ml_scores(texts)
+    model = load_model()
+    all_cues, flagged_all = [], []
+    for i, text in enumerate(texts):
+        cues = cue_scan(text)
+        all_cues.append(cues)
+        flagged = {}
+        # 1) linguistic cues -> noisy-OR score per category
+        for cat, items in cues.items():
+            sc = noisy_or([w for w, _, _ in items])
+            if sc + 1e-9 >= thr:
+                n = len(items)
+                sev = SEV[cat]
+                if cat == "Intimidation" and n >= 3 and sc >= 0.9:
+                    sev = 4  # several independent warning signals in one message
+                shown = "; ".join(f"{lbl} '{m[:60]}'" for _, lbl, m in sorted(items, key=lambda x: -x[0])[:5])
+                flagged[cat] = {"score": sc, "sev": sev, "rule": True,
+                                "why": f"{cat} ({n} signal{'s' if n > 1 else ''}, {sc:.0%}): {shown}"}
+        # 2) machine learning (sentence level) for Threat / Abusive
+        for cat in ("Threat", "Abusive"):
+            if cat in ml[i]:
+                p, sent = ml[i][cat]
+                if p >= ml_thr and cat not in flagged:
+                    sev = (4 if p >= 0.85 else 3) if cat == "Threat" else (2 if p >= 0.75 else 1)
+                    tw = top_words(*model, sent, cat) if model else ""
+                    flagged[cat] = {"score": p, "sev": sev, "rule": False,
+                                    "why": f"ML model: {cat} ({p:.0%}) in \"{sent[:70]}\"" + (f"; key words: {tw}" if tw else "")}
+        flagged_all.append(flagged)
+    # 3) context pass: combine Intimidation cues of up to 4 consecutive messages from the same sender
+    for i in range(len(texts)):
+        if "Intimidation" not in all_cues[i]:
+            continue
+        j0 = i
+        while j0 > 0 and i - j0 < 3 and senders[j0 - 1] == senders[i]:
+            j0 -= 1
+        win = [j for j in range(j0, i + 1) if "Intimidation" in all_cues[j]]
+        if len(win) < 2:
+            continue
+        items = {}
+        for j in win:
+            for w, lbl, m in all_cues[j]["Intimidation"]:
+                items.setdefault(lbl, (w, lbl, m))
+        items = list(items.values())
+        sc = noisy_or([w for w, _, _ in items])
+        # a pile of purely administrative cues ("last chance", "final warning") must not be flagged on their own
+        if sc + 1e-9 >= thr and (len(items) >= 3 or max(w for w, _, _ in items) >= 0.6):
+            sev = 4 if len(items) >= 3 and sc >= 0.9 else SEV["Intimidation"]
+            shown = "; ".join(f"{lbl} '{m[:60]}'" for _, lbl, m in sorted(items, key=lambda x: -x[0])[:5])
+            why = f"Intimidation (context: {len(win)} consecutive messages from {senders[i]}, {sc:.0%}): {shown}"
+            for j in win:
+                if "Intimidation" not in flagged_all[j]:
+                    flagged_all[j]["Intimidation"] = {"score": sc, "sev": sev, "rule": True, "why": why}
+    labels, cats, sevs, reasons, confs = [], [], [], [], []
+    for i, flagged in enumerate(flagged_all):
+        if flagged:
+            # most severe wins; on a tie a rule-based category beats an ML-only one, then the priority order decides
+            main = max(flagged, key=lambda c: (flagged[c]["sev"], flagged[c]["rule"], -CATS.index(c)))
+            order = [main] + [c for c in CATS if c in flagged and c != main]
+            labels.append(main)
+            cats.append(" + ".join(order))
+            sevs.append(flagged[main]["sev"])
+            reasons.append(" | ".join(flagged[c]["why"] for c in order))
+            confs.append(round(max(f["score"] for f in flagged.values()), 2))
+        else:
+            labels.append("Safe")
+            cats.append("Safe")
+            sevs.append(0)
+            reasons.append("")
+            confs.append(round(max([p for p, _ in ml[i].values()], default=0.0), 2))
+    df["label"], df["categories"], df["sev"], df["reason"], df["conf"] = labels, cats, sevs, reasons, confs
+    df["level"] = df["sev"].map(LEVEL)
+    df["points"] = df["sev"].map(lambda s: s * s * 3)
+    return df, find_patterns(df)
+
+
+def find_patterns(df):
+    pats = []
+    # 1. message flood
+    run = (df.sender != df.sender.shift()).cumsum()
+    for _, g in df.groupby(run):
+        if len(g) >= 4:
+            pats.append({"title": "Message flooding", "sender": g.sender.iloc[0], "bonus": 8,
+                         "detail": f"{g.sender.iloc[0]} sent {len(g)} messages in a row without any reply."})
+    # 2. contact after refusal
+    ref = df[df.message.str.contains(REFUSAL)]
+    if not ref.empty:
+        r0 = ref.iloc[0]
+        after = df[(df.no > r0.no) & (df.sender != r0.sender)]
+        if len(after) >= 2:
+            who = after.sender.value_counts().index[0]
+            pats.append({"title": "Contact continued after refusal", "sender": who, "bonus": 12,
+                         "detail": f"{len(after)} message(s) from {who} after {r0.sender} asked them to stop (message #{r0.no})."})
+    # 3. repeated threats / blackmail
+    for s, g in df[df.label.isin(["Threat", "Blackmail", "Intimidation"])].groupby("sender"):
+        if len(g) >= 2:
+            pats.append({"title": "Repeated threats", "sender": s, "bonus": 6,
+                         "detail": f"{s} made {len(g)} threatening / blackmail / intimidating messages."})
+    # 4. escalation
+    for s, g in df[df.sev > 0].groupby("sender"):
+        g = g.sort_values("no")
+        if len(g) >= 4:
+            h = len(g) // 2
+            if g.sev.iloc[h:].mean() >= g.sev.iloc[:h].mean() + 0.5:
+                pats.append({"title": "Escalating severity", "sender": s, "bonus": 8,
+                             "detail": f"Messages from {s} become more severe over time "
+                                       f"(average severity {g.sev.iloc[:h].mean():.1f} rising to {g.sev.iloc[h:].mean():.1f})."})
+    # 5. late-night harassment
+    if df.ts.notna().any():
+        late = df[(df.sev > 0) & (df.ts.dt.hour < 5)]
+        for s, g in late.groupby("sender"):
+            if len(g) >= 2:
+                pats.append({"title": "Late-night harassment", "sender": s, "bonus": 4,
+                             "detail": f"{len(g)} flagged messages from {s} between 12 am and 5 am."})
+    return pats
+
+
+def risk_level(score):
+    return "Low" if score < 20 else "Medium" if score < 45 else "High" if score < 70 else "Critical"
+
+
+def sender_risk(df, pats):
+    out = {}
+    for s, g in df.groupby("sender"):
+        pts = g.points.sum() + sum(p["bonus"] for p in pats if p["sender"] == s)
+        out[s] = int(min(100, pts))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# PRIVACY HELPERS
+# ----------------------------------------------------------------------------
+PII = [(re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "[email]"),
+       (re.compile(r"https?://\S+|www\.\S+"), "[link]"),
+       (re.compile(r"\+?\d[\d\s\-]{8,14}\d"), "[phone]")]
+
+
+def mask_pii(t):
+    for rx, rep in PII:
+        t = rx.sub(rep, t)
+    return t
+
+
+def make_view(df, pats, mask, anon):
+    """Return display copy: masked text / anonymised senders. Raw analysis stays untouched."""
+    v = df.copy()
+    pv = [dict(p) for p in pats]
+    if mask:
+        v["message"] = v["message"].map(mask_pii)
+    if anon:
+        names = list(dict.fromkeys(v.sender))
+        mp = {n: f"Person {chr(65 + i)}" if n != "Unknown" else "Unknown" for i, n in enumerate(names)}
+        v["sender"] = v["sender"].map(mp)
+        for p in pv:
+            for old, new in mp.items():
+                p["detail"] = p["detail"].replace(old, new)
+            p["sender"] = mp.get(p["sender"], p["sender"])
+    return v, pv
+
+
+# ----------------------------------------------------------------------------
+# PDF REPORT
+# ----------------------------------------------------------------------------
+def pdf_safe(s):
+    s = str(s)
+    for k, v in {"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "₹": "Rs.", "•": "-"}.items():
+        s = s.replace(k, v)
+    s = s.encode("latin-1", "replace").decode("latin-1")
+    return re.sub(r"(\S{45})(?=\S)", r"\1 ", s)  # break very long words so the PDF never errors
+
+
+class ReportPDF(FPDF):
+    def header(self):
+        self.set_fill_color(255, 194, 217)
+        self.rect(0, 0, 210, 14, "F")
+        self.set_font("Helvetica", "B", 10)
+        self.set_text_color(58, 11, 34)
+        self.set_xy(10, 4)
+        self.cell(0, 6, "ShieldDM  |  Online Harassment Evidence & Complaint Report")
+        self.set_text_color(0, 0, 0)
+        self.set_y(20)
+
+    def footer(self):
+        self.set_y(-13)
+        self.set_font("Helvetica", "I", 8)
+        self.set_text_color(120, 120, 120)
+        self.cell(0, 8, f"Page {self.page_no()}/{{nb}}  |  Auto-generated draft. Verify with a legal professional before filing.", align="C")
+
+
+def _p(pdf, text, h=5.5, style="", size=10, color=(0, 0, 0)):
+    pdf.set_font("Helvetica", style, size)
+    pdf.set_text_color(*color)
+    pdf.multi_cell(pdf.epw, h, pdf_safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+
+def _h(pdf, text):
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(190, 60, 110)
+    pdf.multi_cell(pdf.epw, 7, pdf_safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_draw_color(255, 182, 213)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + pdf.epw, pdf.get_y())
+    pdf.ln(2)
+    pdf.set_text_color(0, 0, 0)
+
+
+def _kv(pdf, k, v):
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(60, 60, 60)
+    pdf.cell(48, 6, pdf_safe(k))
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(0, 0, 0)
+    pdf.multi_cell(pdf.epw - 48, 6, pdf_safe(v), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+
+JURIS = {
+    "India": [
+        "Do NOT delete the chat. Back up the original export (Chat > Export chat) and keep the phone safe.",
+        "Take screenshots showing the sender's name/number, date and time of each flagged message.",
+        "Report online at cybercrime.gov.in or call the National Cyber Crime helpline 1930 as soon as possible.",
+        "Visit the nearest police station / cyber cell with this report, screenshots and the original chat export.",
+        "Women can also call the Women Helpline 181; if you are in immediate danger, call 112.",
+        "Report and block the account on the platform (Instagram / WhatsApp) AFTER saving all evidence.",
+        "Tell a trusted friend or family member, and avoid replying to or meeting the accused.",
+    ],
+    "United States": [
+        "Do NOT delete the chat. Back up the original export and keep the phone safe.",
+        "Take screenshots showing the sender's name/number, date and time of each flagged message.",
+        "Report online to the FBI Internet Crime Complaint Center (ic3.gov) and to your local police department.",
+        "If you are in immediate danger, call 911.",
+        "If intimate images are involved, the Cyber Civil Rights Initiative (cybercivilrights.org) offers support.",
+        "Report and block the account on the platform AFTER saving all evidence.",
+        "Tell a trusted friend or family member, and avoid replying to or meeting the accused.",
+    ],
+    "United Kingdom": [
+        "Do NOT delete the chat. Back up the original export and keep the phone safe.",
+        "Take screenshots showing the sender's name/number, date and time of each flagged message.",
+        "Report to the police: call 101 (non-emergency) or use your local force's online form. In immediate danger call 999.",
+        "Report Harmful Content (reportharmfulcontent.com) can help with removal; the Revenge Porn Helpline (revengepornhelpline.org.uk) helps if intimate images are involved.",
+        "Report and block the account on the platform AFTER saving all evidence.",
+        "Tell a trusted friend or family member, and avoid replying to or meeting the accused.",
+    ],
+    "Other / not sure": [
+        "Do NOT delete the chat. Back up the original export and keep the phone safe.",
+        "Take screenshots showing the sender's name/number, date and time of each flagged message.",
+        "Report to your local police or cyber-crime unit with this report, the screenshots and the original chat export.",
+        "If you are in immediate danger, call your local emergency number.",
+        "Report and block the account on the platform AFTER saving all evidence.",
+        "Tell a trusted friend or family member, and avoid replying to or meeting the accused.",
+    ],
+}
+GENERIC_LAW = {
+    "Threat": "criminal threats / criminal intimidation laws",
+    "Blackmail": "extortion / blackmail laws",
+    "Intimidation": "criminal intimidation / threatening communications laws",
+    "Sexual Harassment": "sexual harassment and explicit-image laws",
+    "Stalking": "stalking / cyberstalking / harassment laws",
+    "Abusive": "abusive or harassing communications laws",
+}
+LAW_EXAMPLES = {
+    "United States": "For example 18 U.S.C. 875(c) (threats in interstate communications), 18 U.S.C. 2261A (stalking) and state harassment laws.",
+    "United Kingdom": "For example the Protection from Harassment Act 1997 and the Malicious Communications Act 1988.",
+    "Other / not sure": "Check your country's criminal code for threats, harassment, stalking and extortion.",
+}
+
+
+def build_pdf(view, pats, evidence_from, accused, complainant, contact, platform, place, statement, source, risk, anon,
+              jurisdiction="India"):
+    """evidence_from = sender whose messages are evidence (or "All senders"); accused = name printed in the report."""
+    all_s = evidence_from == "All senders"
+    mine = view if all_s else view[view.sender == evidence_from]
+    ev = mine[mine.sev > 0].sort_values("no")
+    pdf = ReportPDF()
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(True, margin=18)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.multi_cell(pdf.epw, 10, "Complaint Report: Online Harassment / Threats", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+    case_id = "SDM-" + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    # --- incident details
+    _h(pdf, "1. Incident details")
+    first = ev.ts.min() if ev.ts.notna().any() else None
+    last = ev.ts.max() if ev.ts.notna().any() else None
+    period = f"{first:%d %b %Y %H:%M}  to  {last:%d %b %Y %H:%M}" if first is not None and pd.notna(first) else \
+        (f"{ev.time.iloc[0]}  to  {ev.time.iloc[-1]}" if len(ev) and ev.time.iloc[0] != "-" else "Not available in chat text")
+    _kv(pdf, "Case reference", case_id)
+    _kv(pdf, "Report generated", datetime.datetime.now().strftime("%d %b %Y, %H:%M"))
+    _kv(pdf, "Complainant", complainant or "Not provided")
+    if contact:
+        _kv(pdf, "Complainant contact", contact)
+    _kv(pdf, "Accused (name / handle)", accused)
+    _kv(pdf, "Platform", platform)
+    _kv(pdf, "Jurisdiction", jurisdiction)
+    _kv(pdf, "Place (city)", place or "Not provided")
+    _kv(pdf, "Incident period", period)
+    _kv(pdf, "Evidence source", source)
+    _kv(pdf, "Messages analysed", f"{len(view)} total, {len(mine)} sent by accused, {len(ev)} flagged")
+    _kv(pdf, "Overall risk", f"{risk}/100  ({risk_level(risk)})")
+    if anon:
+        _kv(pdf, "Privacy note", "Names were anonymised in this report. Turn anonymisation off before filing officially.")
+    # --- complainant statement
+    if statement.strip():
+        _h(pdf, "2. Complainant's statement")
+        _p(pdf, statement.strip())
+    # --- evidence summary
+    _h(pdf, "3. Evidence summary")
+    counts = ev.label.value_counts()
+    cat_txt = ", ".join(f"{n} {c.lower()}" for c, n in counts.items()) or "none"
+    top = LEVEL[int(ev.sev.max())] if len(ev) else "none"
+    pct = (len(ev) / len(mine) * 100) if len(mine) else 0
+    _p(pdf, f"The supplied chat contains {len(mine)} message(s) from {accused}, of which {len(ev)} ({pct:.0f}%) were flagged "
+            f"as harmful by an automated classifier. Flagged content: {cat_txt}. The highest severity found is {top}. "
+            f"The overall risk score for this conversation is {risk}/100 ({risk_level(risk)}).")
+    mp = [p for p in pats if all_s or p["sender"] == evidence_from]
+    if mp:
+        pdf.ln(1)
+        _p(pdf, "Behaviour patterns detected:", style="B")
+        for p in mp:
+            _p(pdf, f"-  {p['title']}: {p['detail']}")
+    # --- flagged messages
+    _h(pdf, "4. Flagged messages (evidence log)")
+    if ev.empty:
+        _p(pdf, "No flagged messages from the selected sender.")
+    for n, (_, r) in enumerate(ev.head(80).iterrows(), 1):
+        if pdf.get_y() > 245:
+            pdf.add_page()
+        pdf.set_fill_color(255, 232, 242)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.multi_cell(pdf.epw, 6, pdf_safe(f"#{n}   " + ("" if r.time == "-" else f"{r.time}   |   ") + f"{r.categories}   |   Severity: {r.level}"),
+                       fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        _p(pdf, f'Message: "{r.message}"', size=10)
+        if r.reason:
+            _p(pdf, f"Detected because: {r.reason}", style="I", size=9, color=(90, 90, 90))
+        pdf.ln(2)
+    if len(ev) > 80:
+        _p(pdf, f"... and {len(ev) - 80} more flagged messages (see CSV export).", style="I")
+    # --- legal
+    _h(pdf, "5. Possible legal provisions (indicative)")
+    all_cats = {c for s in ev.categories for c in s.split(" + ")}
+    for c in [c for c in CATS if c in all_cats]:
+        _p(pdf, f"-  {c}: " + (LAW[c] if jurisdiction == "India" else f"may fall under {GENERIC_LAW[c]}"))
+    if jurisdiction != "India":
+        _p(pdf, LAW_EXAMPLES.get(jurisdiction, LAW_EXAMPLES["Other / not sure"]), size=9)
+    _p(pdf, "These sections are suggestions to help you start the conversation with police or a lawyer. "
+            "The final decision on applicable sections rests with the authorities.", style="I", size=9, color=(90, 90, 90))
+    # --- next steps
+    _h(pdf, "6. Suggested next steps")
+    for step in JURIS.get(jurisdiction, JURIS["Other / not sure"]):
+        _p(pdf, f"-  {step}")
+    # --- declaration
+    pdf.ln(6)
+    _p(pdf, "Declaration: I confirm that the above information and attached chat are true to the best of my knowledge.", size=9)
+    pdf.ln(10)
+    _p(pdf, f"Signature: ____________________        Name: {complainant or '____________________'}        Date: ______________", size=9)
+    return bytes(pdf.output())
+
+
+# ----------------------------------------------------------------------------
+# ----  UI  ----
+# ----------------------------------------------------------------------------
+st.set_page_config(page_title="ShieldDM", page_icon="🛡️", layout="wide")
+
+CSS = """
+<style>
+.stApp { background:
+  radial-gradient(1000px 520px at 0% -10%, rgba(255,182,213,.20), transparent 60%),
+  radial-gradient(800px 500px at 100% 0%, rgba(255,107,129,.14), transparent 55%),
+  radial-gradient(700px 500px at 50% 115%, rgba(244,163,200,.12), transparent 60%), #0a0509; color:#fff; }
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stSidebar"] { background:linear-gradient(180deg,#1c0a15,#12070d); border-right:1px solid rgba(255,182,213,.22); }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.10); }
+h1,h2,h3,h4, label, p, span, div { color:#f7eef2; }
+.hero { background: linear-gradient(120deg,#ffd6e6,#ffbcd5,#ffa6c4,#ff9aa8); background-size:300% 300%;
+  animation: shift 10s ease infinite; border-radius:28px; padding:34px 40px; margin-bottom:22px;
+  box-shadow:0 18px 50px rgba(255,182,213,.30); }
+.hero h1 { margin:0 0 6px; font-weight:800; font-size:3rem; color:#3a0b22; letter-spacing:-.5px; }
+.hero p { margin:0; color:#5c1a38; font-size:1.05rem; }
+@keyframes shift { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+.kpi { background:rgba(255,255,255,.05); border:1px solid rgba(255,182,213,.35); border-radius:20px; padding:18px 16px;
+  text-align:center; transition:transform .25s ease, box-shadow .25s ease; }
+.kpi:hover { transform:translateY(-4px); box-shadow:0 10px 30px rgba(255,182,213,.28); }
+.kpi .v { font-size:2rem; font-weight:800; line-height:1.1; }
+.kpi .t { font-size:.82rem; opacity:.75; margin-bottom:4px; }
+.badge { display:inline-block; padding:3px 12px; border-radius:99px; font-size:.78rem; font-weight:600; color:#2a0a18; }
+.crit { animation: pulse 1.6s infinite; }
+@keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(255,107,129,.7)} 70%{box-shadow:0 0 0 12px rgba(255,107,129,0)} 100%{box-shadow:0 0 0 0 rgba(255,107,129,0)} }
+.msg { background:rgba(255,255,255,.045); border-left:5px solid #ffb6d2; border-radius:14px; padding:12px 16px; margin-bottom:10px; }
+.msg .m { font-size:1rem; margin:6px 0 4px; }
+.msg .r { font-size:.8rem; opacity:.7; }
+.pat { background:linear-gradient(90deg,rgba(255,107,129,.18),rgba(255,182,213,.08)); border:1px solid rgba(255,107,129,.45);
+  border-radius:16px; padding:14px 18px; margin-bottom:10px; }
+.step { background:rgba(255,255,255,.05); border-radius:18px; padding:18px 22px; border:1px dashed rgba(255,182,213,.5); }
+.crow { display:flex; margin:7px 0; }
+.crow.right { justify-content:flex-end; }
+.bub { max-width:74%; padding:10px 15px; border-radius:20px; background:rgba(255,255,255,.07); }
+.crow.left .bub { border-bottom-left-radius:5px; }
+.crow.right .bub { background:rgba(255,182,213,.14); border-bottom-right-radius:5px; }
+.bub.flag { border:1px solid var(--c); box-shadow:0 0 16px -5px var(--c); }
+.bub .who { font-size:.72rem; opacity:.65; margin-bottom:2px; }
+.bub .txt { font-size:1rem; }
+.bub .why { font-size:.76rem; opacity:.7; margin-top:5px; }
+.stButton, .stDownloadButton, [data-testid="stButton"], [data-testid="stDownloadButton"] { width:100%; }
+[data-testid="stElementContainer"]:has(.stButton), [data-testid="stElementContainer"]:has(.stDownloadButton),
+[data-testid="stElementContainer"]:has([data-testid="stButton"]), [data-testid="stElementContainer"]:has([data-testid="stDownloadButton"]) { width:100% !important; }
+.stButton>button, .stDownloadButton>button { width:100%; background:linear-gradient(90deg,#ffc9dc,#ff9fbd); color:#3a0b22; border:0;
+  border-radius:14px; font-weight:600; padding:.6rem 1.2rem; transition:transform .2s ease, box-shadow .2s ease; }
+.stButton>button:hover, .stDownloadButton>button:hover { transform:translateY(-2px); box-shadow:0 8px 24px rgba(255,182,213,.45); color:#3a0b22; }
+.stButton>button:disabled, .stDownloadButton>button:disabled { opacity:.45; box-shadow:none; transform:none; color:#3a0b22; }
+.stTabs [data-baseweb="tab-list"] { gap:20px; border-bottom:1px solid rgba(255,255,255,.12); }
+.stTabs [data-baseweb="tab"] { background:transparent; padding:10px 2px; }
+.stTabs [aria-selected="true"] p { color:#ffb6d2; font-weight:700; }
+.stTabs [data-baseweb="tab-highlight"] { background:#ffb6d2; }
+[data-testid="stSlider"] [role="slider"] { background-color:#ffb6d2 !important; }
+.hero h1, .hero h1 * { color:#3a0b22 !important; }
+.stButton>button p, .stButton>button span, .stDownloadButton>button p, .stDownloadButton>button span { color:#3a0b22 !important; }
+textarea, input { background:#1a0f16 !important; color:#fff !important; }
+@media (prefers-reduced-motion: reduce) { .hero, .crit { animation:none; } .kpi, .stButton>button { transition:none; } }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+def H(s):
+    st.markdown("".join(l.strip() for l in s.splitlines()), unsafe_allow_html=True)
+
+
+def style_fig(fig, h=330):
+    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font=dict(color="#f7eef2", family="Source Sans Pro, Arial, sans-serif"), height=h,
+                      margin=dict(l=10, r=10, t=50, b=10), legend=dict(bgcolor="rgba(0,0,0,0)"))
+    return fig
+
+
+def badge(level):
+    cls = "badge crit" if level == "Critical" else "badge"
+    return f'<span class="{cls}" style="background:{LEVEL_COLORS[level]}">{level}</span>'
+
+
+# ---- session state ---------------------------------------------------------
+for k, v in {"raw": "", "source": "", "last_sig": None, "pdf": None, "paste_text": ""}.items():
+    st.session_state.setdefault(k, v)
+
+
+def clear_all():
+    st.session_state.raw, st.session_state.source, st.session_state.pdf = "", "", None
+    st.session_state["paste_text"] = ""
+
+
+# ---- sidebar ---------------------------------------------------------------
+with st.sidebar:
+    mode = st.radio("Input method", ["📋 Paste chat text", "📁 Upload WhatsApp .txt"])
+    if mode.startswith("📋"):
+        st.text_area("Paste the chat here", key="paste_text", height=230,
+                     placeholder="Paste your chat here...")
+        if st.button("🔍 Analyze pasted text"):
+            if st.session_state.paste_text.strip():
+                st.session_state.raw, st.session_state.source, st.session_state.pdf = st.session_state.paste_text, "Pasted text", None
             else:
-                cc = flagged_all["category"].value_counts().reset_index()
-                cc.columns = ["Category", "Count"]
-                fig = px.pie(cc, names="Category", values="Count", hole=0.58, color="Category",
-                             color_discrete_map=CATEGORY_COLORS, title="Flagged messages by category")
-                fig.update_traces(textinfo="value+percent", marker=dict(line=dict(color="#0b0508", width=2)))
-                stretch(st.plotly_chart, style_fig(fig, 320))
-
-        if not flagged_all.empty:
-            g3, g4 = st.columns(2)
-            with g3:
-                sv = flagged_all["severity"].value_counts().reindex(SEVERITY_ORDER).fillna(0).reset_index()
-                sv.columns = ["Severity", "Count"]
-                fig = px.bar(sv, x="Severity", y="Count", color="Severity", color_discrete_map=SEVERITY_COLORS,
-                             title="Severity levels", text="Count")
-                fig.update_layout(showlegend=False)
-                stretch(st.plotly_chart, style_fig(fig))
-            with g4:
-                tot = res.groupby("sender").size().rename("Total")
-                fl = flagged_all.groupby("sender").size().rename("Flagged")
-                sd = pd.concat([tot, fl], axis=1).fillna(0).reset_index().rename(columns={"index": "sender"})
-                sd = sd.melt(id_vars="sender", var_name="Type", value_name="Messages")
-                fig = px.bar(sd, x="sender", y="Messages", color="Type", barmode="group", title="Messages per sender",
-                             color_discrete_map={"Total": "#5b2a40", "Flagged": "#ff2ea6"})
-                fig.update_xaxes(title="")
-                stretch(st.plotly_chart, style_fig(fig))
-
-            ra = flagged_all.groupby("sender")["score"].agg(["count", "mean", "max"]).reset_index()
-            ra.columns = ["Sender", "Flagged", "Avg risk", "Max risk"]
-            st.markdown("#### 👤 Sender risk profile")
-            for _, r in ra.sort_values("Max risk", ascending=False).iterrows():
-                st.markdown(
-                    f'<div class="sd-card" style="margin-bottom:10px"><b>{html.escape(str(r["Sender"]))}</b> '
-                    f'<span style="color:#d9a6ba">&mdash; {int(r["Flagged"])} flagged &bull; avg {r["Avg risk"]:.0f} &bull; max {r["Max risk"]:.0f}</span>'
-                    f'<div class="riskbar" style="margin-top:8px"><div style="width:{r["Max risk"]:.0f}%"></div></div></div>',
-                    unsafe_allow_html=True)
-
-            if has_time:
-                hh = flagged_all.dropna(subset=["hour"]).groupby("hour").size().reindex(range(24), fill_value=0).reset_index()
-                hh.columns = ["Hour", "Flagged"]
-                fig = px.bar(hh, x="Hour", y="Flagged", title="When flagged messages are sent (hour of day)",
-                             color="Flagged", color_continuous_scale=["#4a1230", "#ff2ea6", "#ff2d55"])
-                fig.update_coloraxes(showscale=False)
-                stretch(st.plotly_chart, style_fig(fig, 280))
-
-    # ------------------------------------------------------------ flagged
-    with tabs[1]:
-        if flagged_all.empty:
-            st.success("Nothing flagged. Try lowering the sensitivity slider in the sidebar.")
+                st.warning("The box is empty. Paste some messages first.")
+    else:
+        f = st.file_uploader("Upload WhatsApp chat (.txt)", type=["txt"],
+                             help="WhatsApp: open the chat > ⋮ > More > Export chat > Without media")
+        if f is not None:
+            sig = (f.name, f.size)
+            if sig != st.session_state.last_sig:  # load once per new file
+                st.session_state.raw = f.getvalue().decode("utf-8-sig", errors="ignore")
+                st.session_state.source, st.session_state.pdf, st.session_state.last_sig = f"Uploaded file: {f.name}", None, sig
         else:
-            f1, f2, f3 = st.columns(3)
-            cats = f1.multiselect("Category", sorted(flagged_all["category"].unique()), default=sorted(flagged_all["category"].unique()))
-            sevs = f2.multiselect("Severity", [s for s in SEVERITY_ORDER if s in set(flagged_all["severity"])],
-                                  default=[s for s in SEVERITY_ORDER if s in set(flagged_all["severity"])])
-            senders = f3.multiselect("Sender", sorted(flagged_all["sender"].unique()), default=sorted(flagged_all["sender"].unique()))
-            f4, f5 = st.columns([1, 2])
-            min_score = f4.slider("Minimum risk score", 0, 100, int(threshold))
-            query = f5.text_input("🔎 Search in messages / reasons")
-            view = flagged_all[flagged_all["category"].isin(cats) & flagged_all["severity"].isin(sevs)
-                               & flagged_all["sender"].isin(senders) & (flagged_all["score"] >= min_score)]
-            if has_time:
-                vt = view["timestamp"].dropna()
-                if not vt.empty and vt.min().date() != vt.max().date():
-                    d1, d2 = st.slider("Date range", vt.min().date(), vt.max().date(), (vt.min().date(), vt.max().date()))
-                    view = view[view["timestamp"].isna() | ((view["timestamp"].dt.date >= d1) & (view["timestamp"].dt.date <= d2))]
-            if query.strip():
-                q = query.strip().lower()
-                view = view[view["message"].str.lower().str.contains(q, regex=False) | view["reasons"].str.lower().str.contains(q, regex=False)]
-            view = view.sort_values("score", ascending=False)
+            st.session_state.last_sig = None
+    st.divider()
+    if st.button("🎬 Load demo data"):
+        st.session_state.raw, st.session_state.source, st.session_state.pdf = DEMO_CHAT, "Demo data", None
+    st.divider()
+    st.markdown("### ⚙️ Detection")
+    flag_pct = st.slider("Flag sensitivity (lower = flags more)", 20, 95, 60, 5,
+                         help="Every message gets a confidence score. It is flagged only when that score reaches "
+                              "this percentage, so changing the slider changes what is flagged, the flagged counts and the risk scores.")
+    slider_info = st.empty()  # filled after the analysis, so the slider effect is visible
+    st.markdown("### 🔒 Privacy")
+    mask = st.toggle("Mask phone numbers & emails", value=True, help="Phone numbers, emails and links become [phone], [email], [link].")
+    anon = st.toggle("Replace sender names with Person A/B", value=False,
+                     help="Applies on screen, in the CSV and in the PDF.")
+    st.caption("Your chat is processed in memory only. Nothing is written to disk or sent anywhere.")
+    st.button("🗑️ Clear all data", on_click=clear_all)
 
-            st.markdown(f"**{len(view)}** of {len(flagged_all)} flagged messages shown")
-            export = view[["id", "timestamp", "sender", "message", "category", "all_categories", "severity", "score", "reasons"]]
-            stretch(st.download_button, "⬇️ Export flagged messages (CSV)", export.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="shielddm_flagged_messages.csv", mime="text/csv")
-            render_flag_cards(view, limit=25)
-            if len(view) > 25:
-                st.caption(f"Showing the 25 highest-risk cards. All {len(view)} rows are in the table below and the CSV.")
-            with st.expander("📑 Table view"):
-                stretch(st.dataframe, export, hide_index=True)
+if load_model() is None:
+    st.warning("model.pkl not found: running with the cue lexicon only. Run `python train.py` to enable the ML model.")
 
-    # ------------------------------------------------------------ timeline
-    with tabs[2]:
-        if flagged_all.empty:
-            st.info("No flagged messages to place on a timeline.")
-        else:
-            plot = flagged_all.copy()
-            xcol = "timestamp" if has_time and plot["timestamp"].notna().any() else "id"
-            if xcol == "timestamp":
-                plot = plot.dropna(subset=["timestamp"])
-            plot["Message"] = plot["message"].str.slice(0, 120)
-            fig = px.scatter(plot, x=xcol, y="score", color="category", size="score", size_max=22,
-                             color_discrete_map=CATEGORY_COLORS, hover_data={"sender": True, "severity": True, "Message": True, "score": ":.0f"},
-                             title="Incident timeline (each dot is a flagged message)")
-            fig.update_yaxes(range=[0, 105], title="Risk score")
-            fig.update_xaxes(title="" if xcol == "timestamp" else "Message number")
-            stretch(st.plotly_chart, style_fig(fig, 420))
-            if xcol == "id":
-                st.caption("This chat has no timestamps, so the timeline is ordered by message number.")
-            st.markdown("#### Chronological log")
-            log = flagged_all.sort_values(["timestamp", "id"])
-            for _, r in log.iterrows():
-                color = SEVERITY_COLORS.get(r["severity"], "#ff2ea6")
-                st.markdown(
-                    f'<div class="sd-card" style="margin-bottom:8px;border-left:5px solid {color}"><b>{ts_str(r["timestamp"])}</b> '
-                    f'&bull; {html.escape(str(r["sender"]))} &bull; <span style="color:{color}">{r["category"]} / {r["severity"]}</span><br>'
-                    f'<span style="color:#ffd9e6">{html.escape(r["message"][:220])}</span></div>', unsafe_allow_html=True)
+# ---- hero ------------------------------------------------------------------
+H("""<div class="hero"><h1>🛡️ ShieldDM</h1>
+<p>AI-powered detection of threats, abuse, sexual harassment, blackmail and stalking in chats — with court-ready evidence reports.</p></div>""")
 
-    # ------------------------------------------------------------ full chat
-    with tabs[3]:
-        only_flagged = st.toggle("Show only flagged", value=False)
-        show = res[res["flagged"]] if only_flagged else res
-        cols_show = ["id", "timestamp", "sender", "message", "category", "severity", "score"]
-        stretch(st.dataframe, show[cols_show], hide_index=True)
-        stretch(st.download_button, "⬇️ Export full analysis (CSV)",
-                res[["id", "timestamp", "sender", "message", "category", "all_categories", "severity", "score", "rule_score", "ml_prob", "reasons"]]
-                .to_csv(index=False).encode("utf-8-sig"), file_name="shielddm_full_analysis.csv", mime="text/csv")
+raw = st.session_state.raw
+if not raw.strip():
+    H("""<div class="step"><b>👈 Nothing analyzed yet.</b><br>Paste a chat, upload a WhatsApp export or load demo data
+from the sidebar to see the dashboard, flagged messages, timeline, full chat and complaint report.</div>""")
+    st.stop()
 
-    # ------------------------------------------------------------ metrics
-    with tabs[4]:
-        if not metrics:
-            st.warning("No metrics found. Run `python train.py` to train the model and generate metrics.json.")
-        else:
-            m = st.columns(4)
-            m[0].markdown(metric_card("✅", "Accuracy", f"{metrics['accuracy']*100:.1f}%", "hold-out test set"), unsafe_allow_html=True)
-            m[1].markdown(metric_card("🎯", "Precision", f"{metrics['precision']*100:.1f}%", "weighted"), unsafe_allow_html=True)
-            m[2].markdown(metric_card("📡", "Recall", f"{metrics['recall']*100:.1f}%", "weighted"), unsafe_allow_html=True)
-            m[3].markdown(metric_card("⚖️", "F1 score", f"{metrics['f1']*100:.1f}%", "weighted"), unsafe_allow_html=True)
-            st.caption(f"Trained {metrics.get('trained_at', '')} on {metrics['n_rows']} rows "
-                       f"({metrics['n_train']} train / {metrics['n_test']} test).")
-            if metrics["n_test"] < 30:
-                st.warning("The test set is very small, so these numbers are only indicative. Add more rows to train.csv for reliable metrics.")
-            b = metrics.get("binary", {})
-            if b:
-                st.markdown(f"**Harmful vs safe:** accuracy {b['accuracy']*100:.1f}% &bull; precision {b['precision']*100:.1f}% "
-                            f"&bull; recall {b['recall']*100:.1f}% &bull; F1 {b['f1']*100:.1f}%")
-            if metrics.get("cv_f1_mean") is not None:
-                st.markdown(f"**5-fold cross-validation F1:** {metrics['cv_f1_mean']*100:.1f}% +/- {metrics['cv_f1_std']*100:.1f}%")
-            lc, rc = st.columns(2)
-            with lc:
-                cm = np.array(metrics["confusion_matrix"])
-                fig = px.imshow(cm, x=metrics["labels"], y=metrics["labels"], text_auto=True, aspect="auto",
-                                color_continuous_scale=["#1c0b13", "#c2185b", "#ff2d55"], title="Confusion matrix")
-                fig.update_xaxes(title="Predicted")
-                fig.update_yaxes(title="Actual")
-                fig.update_coloraxes(showscale=False)
-                stretch(st.plotly_chart, style_fig(fig, 380))
-            with rc:
-                cc = pd.DataFrame({"Label": list(metrics["class_counts"]), "Rows": list(metrics["class_counts"].values())})
-                fig = px.bar(cc, x="Label", y="Rows", title="Training data distribution", color_discrete_sequence=["#ff2ea6"])
-                stretch(st.plotly_chart, style_fig(fig, 380))
-            rep = pd.DataFrame(metrics["report"]).T.drop(index=["accuracy"], errors="ignore")
-            rep = rep[["precision", "recall", "f1-score", "support"]].round(3)
-            stretch(st.dataframe, rep)
-        st.caption("Detection combines the ML model with a transparent keyword/pattern rule engine. "
-                   "Rule-based reasons are shown for every flagged message.")
+# ---- analysis (always on the user's current input) -------------------------
+df, pats = analyze(raw, flag_pct, "")
+if df.empty:
+    st.error("No messages could be read. Paste at least one line of chat text.")
+    st.stop()
+view, pview = make_view(df, pats, mask, anon)
+risks = sender_risk(view, pview)
+accused_default = max(risks, key=risks.get)
+overall = max(risks.values())
+lvl = risk_level(overall)
+flagged = view[view.sev > 0]
+slider_info.caption(f"At {flag_pct}%: **{len(flagged)}** of {len(view)} messages flagged, risk **{overall}/100**")
 
-    # ------------------------------------------------------------ legal report
-    with tabs[5]:
-        st.markdown("### ⚖️ Legal Complaint Report")
-        st.caption("Builds a PDF from the chat you actually loaded: incident details, flagged messages, timestamps, evidence summary and next steps.")
-        if pseudonymize:
-            st.warning("Sender names are currently replaced by Person A/B. Turn that off in the sidebar to put real names in the report.")
-        senders_all = sorted(res["sender"].unique())
-        flagged_counts = flagged_all["sender"].value_counts()
-        default_acc = flagged_counts.idxmax() if not flagged_counts.empty else senders_all[0]
-        r1, r2 = st.columns(2)
-        accused = r1.selectbox("Accused person", senders_all + ["All senders"],
-                               index=senders_all.index(default_acc))
-        others = [s for s in senders_all if s != accused]
-        complainant = r2.text_input("Complainant (your name)", value=others[0] if len(others) == 1 else "")
-        r3, r4 = st.columns(2)
-        case_title = r3.text_input("Case title", value="Online harassment through messaging app")
-        contact = r4.text_input("Your contact details (optional)")
-        jurisdiction = st.selectbox("Jurisdiction for next-step guidance", ["India", "Other / generic"])
-        notes = st.text_area("Your statement / additional context (optional)", height=110,
-                             placeholder="Describe when the harassment started, how you know the person, and how it affected you.")
+tab_dash, tab_msgs, tab_time, tab_chat, tab_model, tab_rep = st.tabs(
+    ["📊 Dashboard", "🚩 Flagged Messages", "🕒 Timeline", "💬 Full Chat", "🤖 Model Metrics", "⚖️ Legal Report"])
 
-        acc_flagged = flagged_all if accused == "All senders" else flagged_all[flagged_all["sender"] == accused]
-        st.markdown(f"This report will include **{len(acc_flagged)}** flagged message(s).")
-        privacy_note = ("Phone numbers/emails masked" if mask_contacts else "No masking") + (
-            "; sender names pseudonymised" if pseudonymize else "")
-        sig = (raw_hash, accused, complainant, case_title, contact, jurisdiction, notes, threshold, mask_contacts, pseudonymize)
+# ---------------- dashboard
+with tab_dash:
+    st.caption(f"Analyzing: **{st.session_state.source}**  |  {len(view)} messages from {view.sender.nunique()} sender(s)")
+    k = st.columns(5)
+    kp = [("Messages", len(view)), ("Flagged", len(flagged)),
+          ("Flagged %", f"{len(flagged) / len(view) * 100:.0f}%"),
+          ("Top severity", LEVEL[int(view.sev.max())]), ("Risk score", f"{overall}/100")]
+    for col, (t, v) in zip(k, kp):
+        col.markdown(f'<div class="kpi"><div class="t">{t}</div><div class="v">{v}</div></div>', unsafe_allow_html=True)
+    st.write("")
+    H(f'<div style="margin-bottom:6px">Overall risk level: {badge(lvl)}</div>')
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+    g = go.Figure(go.Indicator(mode="gauge+number", value=overall, title={"text": "Risk score"},
+                               gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#ffb6d2"},
+                                      "bgcolor": "#1a0f16",
+                                      "steps": [{"range": [0, 20], "color": "#2a1b24"}, {"range": [20, 45], "color": "#4a2a3a"},
+                                                {"range": [45, 70], "color": "#6b2f4a"}, {"range": [70, 100], "color": "#8a2b46"}]}))
+    c1.plotly_chart(style_fig(g), key="gauge", theme=None)
+    cc = view.label.value_counts().reset_index()
+    cc.columns = ["Category", "Messages"]
+    c2.plotly_chart(style_fig(px.pie(cc, names="Category", values="Messages", hole=.55, color="Category",
+                                     color_discrete_map=CAT_COLORS, title="Category split")), key="pie", theme=None)
+    if len(flagged):
+        sb = flagged.groupby(["sender", "label"]).size().reset_index(name="Messages")
+        c3.plotly_chart(style_fig(px.bar(sb, x="sender", y="Messages", color="label", color_discrete_map=CAT_COLORS,
+                                         title="Flagged messages by sender", labels={"label": "Category", "sender": "Sender"})),
+                        key="bar", theme=None)
+    else:
+        c3.success("No harmful messages detected in this chat. 🎉")
+    st.markdown("#### 🧩 Behavior patterns")
+    if pview:
+        for p in pview:
+            H(f'<div class="pat"><b>⚠️ {html.escape(p["title"])}</b><br>{html.escape(p["detail"])}</div>')
+    else:
+        st.info("No harassment patterns (flooding, escalation, contact after refusal…) found.")
+    st.markdown("#### 🔥 Most severe messages")
+    for _, r in flagged.sort_values(["sev", "no"], ascending=[False, True]).head(5).iterrows():
+        H(f'<div class="msg" style="border-left-color:{CAT_COLORS[r.label]}">{ICON[r.label]} <b>{html.escape(r.categories)}</b> '
+          f'{badge(r.level)} <span class="r">  #{r.no}  {html.escape(r.sender)}  {html.escape(r.time)}</span>'
+          f'<div class="m">{html.escape(r.message)}</div><div class="r">Why: {html.escape(r.reason or "-")}</div></div>')
 
-        if stretch(st.button, "⚖️ Generate Legal Complaint Report", type="primary"):
-            try:
-                with st.spinner("Building your PDF..."):
-                    ss.pdf = build_pdf(res, acc_flagged, accused, complainant, case_title, contact, notes,
-                                       jurisdiction, ss.source, raw_hash, overall, privacy_note)
-                    ss.pdf_sig = sig
-                st.success("Report ready. Download it below.")
-            except ModuleNotFoundError:
-                st.error("The PDF library is missing. In your terminal run:  pip install reportlab")
-            except Exception as e:  # keep the app alive and show what went wrong
-                st.error(f"Could not build the PDF: {e}")
-        if ss.get("pdf") and ss.get("pdf_sig") == sig:
-            stretch(st.download_button, "⬇️ Download PDF report", ss.pdf,
-                    file_name=f"ShieldDM_Complaint_Report_{dt.datetime.now():%Y%m%d_%H%M}.pdf", mime="application/pdf")
-        elif ss.get("pdf"):
-            st.info("Your inputs changed. Press Generate again to refresh the PDF.")
+# ---------------- flagged messages with filters
+with tab_msgs:
+    f1, f2, f3, f4 = st.columns([1.3, 1, 1, 1.2])
+    cat_sel = f1.multiselect("Category", CATS + ["Safe"], default=CATS)
+    snd_sel = f2.multiselect("Sender", sorted(view.sender.unique()), default=sorted(view.sender.unique()))
+    min_sev = f3.select_slider("Minimum severity", ["Low", "Medium", "High", "Critical"], value="Low")
+    kw = f4.text_input("Search text")
+    ms = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}[min_sev]
+    flt = view[view.label.isin(cat_sel) & view.sender.isin(snd_sel) & ((view.sev >= ms) | (view.label == "Safe"))]
+    if kw:
+        flt = flt[flt.message.str.contains(kw, case=False, regex=False)]
+    out = flt[["no", "time", "sender", "message", "categories", "level", "points", "reason", "conf"]].rename(
+        columns={"no": "#", "time": "Time", "sender": "Sender", "message": "Message", "categories": "Category",
+                 "level": "Severity", "points": "Risk pts", "reason": "Reason", "conf": "Confidence"})
+    st.caption(f"Showing {len(out)} of {len(view)} messages")
+    st.dataframe(out, hide_index=True, column_config={
+        "Risk pts": st.column_config.ProgressColumn("Risk pts", min_value=0, max_value=48, format="%d"),
+        "Message": st.column_config.TextColumn(width="large"), "Reason": st.column_config.TextColumn(width="large")})
+    st.download_button("⬇️ Export results as CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                       "shielddm_results.csv", "text/csv")
 
+# ---------------- timeline
+with tab_time:
+    tl = view.copy()
+    use_ts = tl.ts.notna().all()
+    tl["x"] = tl.ts if use_ts else tl.no
+    tl["short"] = tl.message.str.slice(0, 70)
+    fig = px.scatter(tl, x="x", y="sev", color="label", color_discrete_map=CAT_COLORS, hover_data=["sender", "short"],
+                     title="Incident timeline (severity of each message)",
+                     labels={"x": "Time" if use_ts else "Message #", "sev": "Severity (0-4)", "label": "Category"})
+    fig.update_traces(marker=dict(size=14, line=dict(width=1, color="#fff")))
+    fig.update_yaxes(tickvals=[0, 1, 2, 3, 4], ticktext=["Safe", "Low", "Medium", "High", "Critical"])
+    st.plotly_chart(style_fig(fig, 380), key="tl1", theme=None)
+    tl["cum"] = tl.points.cumsum().clip(upper=100)
+    fig2 = px.area(tl, x="x", y="cum", title="Escalation curve (cumulative risk)",
+                   labels={"x": "Time" if use_ts else "Message #", "cum": "Risk"})
+    fig2.update_traces(line_color="#ffb6d2", fillcolor="rgba(255,182,213,.35)")
+    st.plotly_chart(style_fig(fig2, 300), key="tl2", theme=None)
+    if use_ts:
+        hr = flagged.assign(hour=flagged.ts.dt.hour).groupby("hour").size().reset_index(name="Flagged")
+        if len(hr):
+            st.plotly_chart(style_fig(px.bar(hr, x="hour", y="Flagged", title="Flagged messages by hour of day",
+                                             color_discrete_sequence=["#ff9a8a"]), 260), key="tl3", theme=None)
 
-if __name__ == "__main__":
-    main()
+# ---------------- full chat
+with tab_chat:
+    only_flag = st.toggle("Show only flagged messages", value=False)
+    sub_chat = view[view.sev > 0] if only_flag else view
+    first_sender = view.sender.iloc[0]
+    st.caption(f"{len(sub_chat)} message(s) shown. Highlighted bubbles were flagged; the reason is shown under each one.")
+    parts = []
+    for _, r in sub_chat.head(300).iterrows():
+        side = "left" if r.sender == first_sender else "right"
+        col, fl = CAT_COLORS[r.label], r.sev > 0
+        tag = (f'<span class="badge" style="background:{col}">{ICON[r.label]} {html.escape(r.categories)} · {r.level}</span>'
+               if fl else "")
+        why = f'<div class="why">{html.escape(r.reason[:220])}</div>' if fl and r.reason else ""
+        tm = "" if r.time == "-" else f" · {html.escape(r.time)}"
+        parts.append(f'<div class="crow {side}"><div class="bub{" flag" if fl else ""}" style="--c:{col}">'
+                     f'<div class="who">{html.escape(r.sender)}{tm} · #{r.no}</div><div class="txt">{html.escape(r.message)}</div>'
+                     f'{tag}{why}</div></div>')
+    H("".join(parts))
+    if len(sub_chat) > 300:
+        st.caption("Showing the first 300 messages. Use Flagged Messages for the complete list.")
+
+# ---------------- model metrics
+with tab_model:
+    m = load_metrics()
+    st.markdown("**Detection engine:** hybrid. A cue lexicon (English + Hinglish) scores threats, blackmail, intimidation "
+                "(indirect threats), sexual harassment, stalking and abuse, and combines several weak signals into one "
+                "confidence. A sentence-level ML model (TF-IDF + Logistic Regression) adds threat and abuse detection. "
+                "The sensitivity slider decides how much confidence is needed to flag a message.")
+    if m:
+        # Every part is optional, and any problem is caught here, so an old or incomplete metrics.json can never
+        # break this tab or the tabs after it (Legal Report).
+        try:
+            a_, b_, c_, d_ = st.columns(4)
+            acc_v = f"{m['accuracy']:.1%}" if "accuracy" in m else "n/a"
+            f1_v = f"{m['macro_f1']:.2f}" if "macro_f1" in m else "n/a"
+            for col, (t, v) in zip((a_, b_, c_, d_), [("Accuracy", acc_v), ("Macro F1", f1_v),
+                                                       ("Train rows", m.get("train_rows", "n/a")), ("Test rows", m.get("test_rows", "n/a"))]):
+                col.markdown(f'<div class="kpi"><div class="t">{t}</div><div class="v">{v}</div></div>', unsafe_allow_html=True)
+            st.write("")
+            r1, r2 = st.columns(2)
+            if m.get("report"):
+                r1.markdown("**Per-class report**")
+                r1.dataframe(pd.DataFrame(m["report"]).T.round(2))
+            if m.get("confusion_matrix") and m.get("labels"):
+                cm = pd.DataFrame(m["confusion_matrix"], index=m["labels"], columns=m["labels"])
+                r2.plotly_chart(style_fig(px.imshow(cm, text_auto=True, color_continuous_scale=["#1a0f16", "#ffb6d2", "#ff5c7a"],
+                                                    title="Confusion matrix", labels=dict(x="Predicted", y="Actual")), 330),
+                                key="cm", theme=None)
+            if m.get("comparison"):
+                st.markdown("**Model comparison**")
+                st.dataframe(pd.DataFrame(m["comparison"]), hide_index=True)
+            v = m.get("veiled_validation")
+            if v:
+                st.markdown("**Indirect-threat check** (hand-written sentences that were never used for training)")
+                va, vb = st.columns(2)
+                va.metric("Veiled threats caught by the ML model alone", f"{v['ml_recall']:.0%}", help=f"{v['veiled_sentences']} sentences")
+                vb.metric("Harmless look-alikes wrongly flagged", f"{v['ml_false_alarm']:.0%}", help=f"{v['safe_lookalikes']} sentences")
+                st.caption("The cue lexicon and the context pass catch more of these on top of the ML model.")
+            st.caption("These numbers come from held-out Jigsaw comments only (hand-written chat samples are used for training, never for testing). "
+                       "The ML model handles Safe / Abusive / Threat; blackmail, intimidation, sexual harassment and stalking come from the cue lexicon.")
+        except Exception:
+            st.warning("metrics.json is incomplete or from an older version. Run `python train.py` once to regenerate it. "
+                       "The rest of the app is not affected.")
+    else:
+        st.info("metrics.json not found. Run `python train.py` to generate evaluation metrics.")
+
+# ---------------- legal report
+with tab_rep:
+    st.markdown("### ⚖️ Legal Complaint Report")
+    st.caption("Builds a PDF from the chat you actually loaded: incident details, flagged messages, timestamps, evidence summary and next steps.")
+    senders = sorted(view.sender.unique())
+    MANUAL = "✍️ Enter manually"
+    ev_opts = senders + (["All senders"] if len(senders) > 1 else [])
+    opts = ev_opts + [MANUAL]
+    c1, c2 = st.columns(2)
+    choice = c1.selectbox("Accused person", opts, index=opts.index(accused_default) if accused_default in opts else 0,
+                          help="Pick a sender from the chat, or choose 'Enter manually' to type any name or username.")
+    comp = c2.text_input("Complainant (your name)")
+    if choice == MANUAL:
+        typed = c1.text_input("Accused name or username", placeholder="e.g. Rohan Mehta or @rohan_insta")
+        ev_from = c1.selectbox("Whose messages are the evidence?", ev_opts,
+                               index=ev_opts.index(accused_default) if accused_default in ev_opts else 0)
+        acc_name = typed.strip()
+    else:
+        ev_from, acc_name = choice, ("All senders in this chat" if choice == "All senders" else choice)
+    contact = c2.text_input("Your contact details (optional)")
+    juris = st.selectbox("Jurisdiction for next-step guidance", list(JURIS))
+    stmt = st.text_area("Your statement / additional context (optional)", height=100)
+    sub = view if ev_from == "All senders" else view[view.sender == ev_from]
+    n_ev = int((sub.sev > 0).sum())
+    need_name = choice == MANUAL and not acc_name
+    if need_name:
+        st.warning("Type the accused person's name or username to continue.")
+    elif n_ev == 0:
+        st.warning("No flagged messages for this selection, so there is no evidence to put in a report.")
+    else:
+        st.write(f"This report will include **{n_ev}** flagged message(s) against **{acc_name}**.")
+    if st.button("⚖️ Generate Legal Complaint Report", disabled=(n_ev == 0 or need_name)):
+        try:
+            plat = "WhatsApp" if (view.time != "-").any() else "Not specified"
+            st.session_state.pdf = build_pdf(view, pview, ev_from, acc_name, comp.strip(), contact.strip(), plat, "",
+                                             stmt, st.session_state.source,
+                                             overall if ev_from == "All senders" else risks.get(ev_from, overall), anon, juris)
+            st.session_state.pdf_name = f"complaint_report_{re.sub(r'[^A-Za-z0-9]+', '_', acc_name).strip('_') or 'accused'}.pdf"
+        except Exception as e:  # never crash the app
+            st.session_state.pdf = None
+            st.error(f"Could not create the PDF: {e}")
+    if st.session_state.pdf:
+        st.success("Report ready. Download it below.")
+    st.download_button("⬇️ Download PDF report", st.session_state.pdf or b"",
+                       st.session_state.get("pdf_name", "complaint_report.pdf"), "application/pdf",
+                       disabled=not st.session_state.pdf)
+    if st.session_state.pdf and mask:
+        st.caption("Phone numbers, emails and links are masked in this report (Privacy settings in the sidebar).")
